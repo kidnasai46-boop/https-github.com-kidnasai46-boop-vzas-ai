@@ -37,10 +37,11 @@ export default function Login() {
       />
       <SafeAreaView style={styles.safe}>
         <View style={styles.hero}>
-          <View style={styles.logoCircle}>
-            <Ionicons name="sparkles" size={48} color={Colors.brandPrimary} />
-          </View>
-          <Text style={styles.brand}>Personae</Text>
+          <Image
+            source={require('../assets/images/vzas-logo.png')}
+            style={styles.logo}
+            resizeMode="contain"
+          />
           <Text style={styles.tagline}>Chat with characters from any universe.</Text>
         </View>
 
@@ -85,18 +86,8 @@ const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: Colors.bgPrimary },
   bgGlow: { position: 'absolute', top: -100, left: 0, right: 0, height: 400 },
   safe: { flex: 1, justifyContent: 'space-between', paddingHorizontal: Spacing.lg },
-  hero: { alignItems: 'center', marginTop: Spacing.xxl },
-  logoCircle: {
-    width: 96, height: 96, borderRadius: 48,
-    backgroundColor: Colors.bgSecondary,
-    alignItems: 'center', justifyContent: 'center',
-    borderWidth: 1, borderColor: 'rgba(124,58,237,0.4)',
-    marginBottom: Spacing.lg,
-  },
-  brand: {
-    color: Colors.textPrimary,
-    fontSize: 38, fontWeight: '800', letterSpacing: -1,
-  },
+  hero: { alignItems: 'center', marginTop: Spacing.xl },
+  logo: { width: 260, height: 260, marginBottom: Spacing.sm },
   tagline: {
     color: Colors.textSecondary,
     fontSize: 16,

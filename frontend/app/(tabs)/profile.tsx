@@ -86,7 +86,7 @@ export default function Profile() {
           </Pressable>
         </View>
 
-        <Text style={styles.version}>Personae · v0.1.0</Text>
+        <Text style={styles.version}>VZAS.AI · v0.1.0</Text>
       </ScrollView>
     </SafeAreaView>
   );

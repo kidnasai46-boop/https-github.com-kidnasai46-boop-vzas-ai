@@ -365,7 +365,7 @@ async def delete_chat(chat_id: str, user: dict = Depends(get_current_user)):
 
 @api_router.get("/")
 async def root():
-    return {"message": "AI Character Chat API"}
+    return {"message": "VZAS.AI API"}
 
 
 app.include_router(api_router)
