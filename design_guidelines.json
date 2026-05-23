@@ -1,0 +1,206 @@
+{
+  "theme": "dark",
+  "archetype": "5 (Luxury / Immersive with Neon accents)",
+  "typography": {
+    "font_family_primary": "Inter, SF Pro Display",
+    "font_family_secondary": "Inter, SF Pro Display",
+    "scales": {
+      "h1": { "font_size": 28, "font_weight": "bold", "letter_spacing": -0.5, "line_height": 34 },
+      "h2": { "font_size": 22, "font_weight": "600", "letter_spacing": -0.3, "line_height": 28 },
+      "h3": { "font_size": 18, "font_weight": "500", "letter_spacing": -0.2, "line_height": 24 },
+      "body": { "font_size": 16, "font_weight": "normal", "letter_spacing": 0, "line_height": 24 },
+      "caption": { "font_size": 13, "font_weight": "normal", "letter_spacing": 0.2, "line_height": 18 },
+      "button": { "font_size": 16, "font_weight": "600", "letter_spacing": 0.5, "line_height": 20, "text_transform": "none" }
+    }
+  },
+  "colors": {
+    "background": {
+      "primary": "#0D0D1A",
+      "secondary": "#1A1A2E",
+      "card": "#1A1A2E",
+      "bottom_sheet": "#1A1A2E"
+    },
+    "text": {
+      "primary": "#FFFFFF",
+      "secondary": "#A0A0C0",
+      "inverse": "#0D0D1A"
+    },
+    "brand": {
+      "primary": "#7C3AED",
+      "secondary": "#06B6D4"
+    },
+    "status": {
+      "success": "#10B981",
+      "warning": "#F59E0B",
+      "error": "#EF4444"
+    },
+    "border": {
+      "default": "rgba(255, 255, 255, 0.1)",
+      "focus": "#7C3AED"
+    }
+  },
+  "spacing": {
+    "xs": 4,
+    "sm": 8,
+    "md": 16,
+    "lg": 24,
+    "xl": 32,
+    "2xl": 48
+  },
+  "border_radius": {
+    "sm": 8,
+    "md": 16,
+    "lg": 24,
+    "pill": 9999
+  },
+  "shadows": {
+    "card": "0px 4px 12px rgba(0, 0, 0, 0.3)",
+    "glow_primary": "0px 0px 16px rgba(124, 58, 237, 0.4)",
+    "glow_secondary": "0px 0px 16px rgba(6, 182, 212, 0.4)"
+  },
+  "components": {
+    "buttons": {
+      "primary": {
+        "style": "pill_shaped",
+        "background": "linear-gradient(90deg, #7C3AED, #9D4CDD)",
+        "text_color": "#FFFFFF",
+        "border_radius": 9999,
+        "padding": "16px 24px"
+      },
+      "secondary": {
+        "style": "rounded_rectangle",
+        "background": "transparent",
+        "border": "1px solid rgba(255,255,255,0.2)",
+        "text_color": "#FFFFFF",
+        "border_radius": 16,
+        "padding": "16px 24px"
+      }
+    },
+    "cards": {
+      "background": "#1A1A2E",
+      "border_radius": 16,
+      "padding": 16,
+      "shadow": "0px 4px 12px rgba(0, 0, 0, 0.3)",
+      "border": "1px solid rgba(255, 255, 255, 0.05)"
+    },
+    "navigation_bar": {
+      "type": "bottom_tab",
+      "style": "frosted_glass",
+      "background": "rgba(26, 26, 46, 0.8)",
+      "blur": "10px",
+      "active_tint": "#7C3AED",
+      "inactive_tint": "#A0A0C0"
+    },
+    "bottom_sheet": {
+      "background": "#1A1A2E",
+      "border_top_radius": 24,
+      "indicator_color": "rgba(255,255,255,0.2)"
+    },
+    "inputs": {
+      "background": "rgba(255, 255, 255, 0.05)",
+      "border": "1px solid rgba(255, 255, 255, 0.1)",
+      "border_radius": 12,
+      "padding": "16px",
+      "text_color": "#FFFFFF",
+      "placeholder_color": "#A0A0C0"
+    },
+    "chat_bubbles": {
+      "user": {
+        "background": "#7C3AED",
+        "text_color": "#FFFFFF",
+        "border_radius": "20px 20px 4px 20px"
+      },
+      "character": {
+        "background": "#1A1A2E",
+        "border": "1px solid rgba(255, 255, 255, 0.1)",
+        "text_color": "#FFFFFF",
+        "border_radius": "20px 20px 20px 4px"
+      }
+    }
+  },
+  "animations": {
+    "buttons": "Subtle scale down (0.95) on press",
+    "avatars": "Slow continuous breathing or subtle float animation for character immersion",
+    "navigation": "Smooth crossfade on tab switch",
+    "bottom_sheet": "Spring physics for opening/closing"
+  },
+  "testing": {
+    "required_attributes": ["data-testid"]
+  },
+  "media": {
+    "character_avatars": [
+      {
+        "url": "https://images.unsplash.com/photo-1440589473619-3cde28941638?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1NzB8MHwxfHNlYXJjaHwzfHxjaW5lbWF0aWMlMjBwb3J0cmFpdCUyMGZhbnRhc3l8ZW58MHx8fHwxNzc5NTU5NTQ3fDA&ixlib=rb-4.1.0&q=85",
+        "description": "Fantasy character, blonde woman with red lipstick",
+        "genre": "Fantasy / Drama"
+      },
+      {
+        "url": "https://images.unsplash.com/photo-1574244931790-ee19df716899?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1NzB8MHwxfHNlYXJjaHw0fHxjaW5lbWF0aWMlMjBwb3J0cmFpdCUyMGZhbnRhc3l8ZW58MHx8fHwxNzc5NTU5NTQ3fDA&ixlib=rb-4.1.0&q=85",
+        "description": "Fantasy character, sitting beside tree",
+        "genre": "Fantasy / Adventure"
+      },
+      {
+        "url": "https://images.pexels.com/photos/29376153/pexels-photo-29376153.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+        "description": "Mysterious character in green hood",
+        "genre": "Mystery / Adventure"
+      },
+      {
+        "url": "https://images.pexels.com/photos/27362449/pexels-photo-27362449.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+        "description": "Stylish adult in smoky setting",
+        "genre": "Drama / Mystery"
+      },
+      {
+        "url": "https://images.unsplash.com/flagged/photo-1579451442952-f0365f3f0aed?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzNTl8MHwxfHNlYXJjaHwzfHxjaW5lbWF0aWMlMjBwb3J0cmFpdCUyMGN5YmVycHVuayUyMG5lb258ZW58MHx8fHwxNzc5NTU5NTQ3fDA&ixlib=rb-4.1.0&q=85",
+        "description": "Sci-fi character, blue hair",
+        "genre": "Sci-Fi"
+      },
+      {
+        "url": "https://images.unsplash.com/flagged/photo-1579451443170-44b3963c3341?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzNTl8MHwxfHNlYXJjaHw0fHxjaW5lbWF0aWMlMjBwb3J0cmFpdCUyMGN5YmVycHVuayUyMG5lb258ZW58MHx8fHwxNzc5NTU5NTQ3fDA&ixlib=rb-4.1.0&q=85",
+        "description": "Sci-fi character, purple hair",
+        "genre": "Sci-Fi"
+      },
+      {
+        "url": "https://images.unsplash.com/photo-1627589161730-0d90bea5a656?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzNTl8MHwxfHNlYXJjaHwyfHxjaW5lbWF0aWMlMjBwb3J0cmFpdCUyMGN5YmVycHVuayUyMG5lb258ZW58MHx8fHwxNzc5NTU5NTQ3fDA&ixlib=rb-4.1.0&q=85",
+        "description": "Cyberpunk character, holding glass",
+        "genre": "Sci-Fi / Drama"
+      },
+      {
+        "url": "https://images.unsplash.com/photo-1634733049839-0292be607569?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzMzJ8MHwxfHNlYXJjaHwzfHxjaW5lbWF0aWMlMjBwb3J0cmFpdCUyMG15c3RlcnklMjBkcmFtYXRpY3xlbnwwfHx8fDE3Nzk1NTk1NDd8MA&ixlib=rb-4.1.0&q=85",
+        "description": "Woman in dark mysterious setting",
+        "genre": "Mystery / Thriller"
+      },
+      {
+        "url": "https://images.unsplash.com/photo-1711464669343-2596d0f1b526?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzMzJ8MHwxfHNlYXJjaHw0fHxjaW5lbWF0aWMlMjBwb3J0cmFpdCUyMG15c3RlcnklMjBkcmFtYXRpY3xlbnwwfHx8fDE3Nzk1NTk1NDd8MA&ixlib=rb-4.1.0&q=85",
+        "description": "Young man standing in front of wall, dramatic lighting",
+        "genre": "Drama / Mystery"
+      },
+      {
+        "url": "https://images.unsplash.com/photo-1496203695688-3b8985780d6a?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzMzJ8MHwxfHNlYXJjaHwyfHxjaW5lbWF0aWMlMjBwb3J0cmFpdCUyMG15c3RlcnklMjBkcmFtYXRpY3xlbnwwfHx8fDE3Nzk1NTk1NDd8MA&ixlib=rb-4.1.0&q=85",
+        "description": "Dramatic portrait of a woman in black",
+        "genre": "Mystery"
+      },
+      {
+        "url": "https://images.unsplash.com/photo-1775179182715-61dd143f7899?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjY2NzN8MHwxfHNlYXJjaHwzfHxjaW5lbWF0aWMlMjBwb3J0cmFpdCUyMHJvbWFudGljJTIwc29mdHxlbnwwfHx8fDE3Nzk1NTk1NDZ8MA&ixlib=rb-4.1.0&q=85",
+        "description": "Romantic portrait, elegant pose",
+        "genre": "Romance"
+      },
+      {
+        "url": "https://images.pexels.com/photos/6719065/pexels-photo-6719065.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+        "description": "Vintage couple, intimate setting",
+        "genre": "Romance / Drama"
+      },
+      {
+        "url": "https://images.unsplash.com/photo-1763744068529-7f73c3a209f4?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjY2NzN8MHwxfHNlYXJjaHwxfHxjaW5lbWF0aWMlMjBwb3J0cmFpdCUyMHJvbWFudGljJTIwc29mdHxlbnwwfHx8fDE3Nzk1NTk1NDZ8MA&ixlib=rb-4.1.0&q=85",
+        "description": "Young woman wearing a crown and festive lights",
+        "genre": "Fantasy / Romance"
+      }
+    ]
+  },
+  "instructions_to_main_agent": [
+    "Implement in React Native (Expo). Do not use HTML/CSS DOM elements like div, span.",
+    "Ensure all interactive components use data-testid (or testID acting as data-testid) for automated testing.",
+    "Use deep/dark themes prominently as per palette. Avoid solid white backgrounds.",
+    "Leverage React Native Reanimated or standard Animated API for subtle avatar floats (breathing effect).",
+    "For the bottom nav bar, utilize a BlurView or similar native component to achieve the frosted glass effect."
+  ]
+}
