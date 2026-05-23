@@ -33,6 +33,9 @@ export default function Profile() {
 
   if (!user) return null;
 
+  const persona = user.persona || {};
+  const hasPersona = !!persona.name;
+
   return (
     <SafeAreaView style={styles.safe} edges={['top']} testID="profile-screen">
       <ScrollView contentContainerStyle={{ paddingBottom: 120 }}>
@@ -46,6 +49,30 @@ export default function Profile() {
           )}
           <Text style={styles.name} testID="profile-name">{user.name}</Text>
           <Text style={styles.email}>{user.email}</Text>
+        </View>
+
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>Your Persona</Text>
+          <Pressable
+            testID="profile-persona-btn"
+            style={styles.personaCard}
+            onPress={() => router.push('/persona')}
+          >
+            <View style={styles.personaIcon}>
+              <Ionicons name="person-circle" size={28} color={Colors.brandPrimary} />
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.personaTitle}>
+                {hasPersona ? persona.name : 'Set up your persona'}
+              </Text>
+              <Text style={styles.personaSub} numberOfLines={2}>
+                {hasPersona
+                  ? (persona.bio || 'Tap to edit your details.')
+                  : 'Tell your AI companions who they\'re talking to.'}
+              </Text>
+            </View>
+            <Ionicons name="chevron-forward" size={20} color={Colors.textSecondary} />
+          </Pressable>
         </View>
 
         <View style={styles.section}>
@@ -120,4 +147,16 @@ const styles = StyleSheet.create({
   },
   actionText: { fontSize: 15, fontWeight: '600' },
   version: { color: Colors.textSecondary, textAlign: 'center', marginTop: 32, fontSize: 12 },
+  personaCard: {
+    flexDirection: 'row', alignItems: 'center', gap: 12,
+    backgroundColor: Colors.bgSecondary, padding: 14, borderRadius: Radius.md,
+    borderWidth: 1, borderColor: Colors.borderSubtle,
+  },
+  personaIcon: {
+    width: 44, height: 44, borderRadius: 22,
+    backgroundColor: 'rgba(124,58,237,0.15)',
+    alignItems: 'center', justifyContent: 'center',
+  },
+  personaTitle: { color: '#fff', fontSize: 15, fontWeight: '700' },
+  personaSub: { color: Colors.textSecondary, fontSize: 12, marginTop: 4, lineHeight: 16 },
 });

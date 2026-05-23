@@ -9,6 +9,12 @@ export interface AuthUser {
   email: string;
   name: string;
   picture?: string | null;
+  persona?: {
+    name?: string;
+    age?: string;
+    gender?: string;
+    bio?: string;
+  };
 }
 
 interface AuthContextValue {
@@ -17,6 +23,7 @@ interface AuthContextValue {
   signIn: () => Promise<void>;
   signOut: () => Promise<void>;
   processSessionId: (sessionId: string) => Promise<void>;
+  refresh: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
@@ -137,7 +144,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   return (
-    <AuthContext.Provider value={{ user, loading, signIn, signOut, processSessionId }}>
+    <AuthContext.Provider value={{ user, loading, signIn, signOut, processSessionId, refresh }}>
       {children}
     </AuthContext.Provider>
   );

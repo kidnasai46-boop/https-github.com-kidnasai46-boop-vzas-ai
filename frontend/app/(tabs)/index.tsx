@@ -1,34 +1,30 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import {
-  View,
-  Text,
-  StyleSheet,
-  ScrollView,
-  TextInput,
-  Image,
-  Pressable,
-  RefreshControl,
-  ActivityIndicator,
-  FlatList,
+  View, Text, StyleSheet, ScrollView, TextInput, Image, Pressable,
+  RefreshControl, ActivityIndicator, FlatList,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Ionicons } from '@expo/vector-icons';
-import { useRouter } from 'expo-router';
+import { useRouter, useFocusEffect } from 'expo-router';
+import * as Haptics from 'expo-haptics';
 
 import { Colors, Radius, Spacing } from '@/src/theme/colors';
 import { api } from '@/src/api/client';
 
-const GENRES = ['All', 'Fantasy', 'Sci-Fi', 'Romance', 'Mystery', 'Drama', 'Adventure'];
-const GENRE_ICONS: Record<string, any> = {
-  All: 'sparkles',
-  Fantasy: 'sparkles',
-  'Sci-Fi': 'planet',
-  Romance: 'heart',
-  Mystery: 'eye',
-  Drama: 'flame',
-  Adventure: 'compass',
-};
+const CATEGORIES = [
+  { key: 'Trending', label: 'Trending', icon: 'flame' as const },
+  { key: 'Favorites', label: 'Favorites', icon: 'heart' as const },
+  { key: 'All', label: 'All', icon: 'sparkles' as const },
+  { key: 'Anime', label: 'Anime', icon: 'star' as const },
+  { key: 'Romance', label: 'Romance', icon: 'heart-circle' as const },
+  { key: 'Helpers', label: 'Helpers', icon: 'medkit' as const },
+  { key: 'Heroes', label: 'Heroes', icon: 'shield' as const },
+  { key: 'Mystery', label: 'Mystery', icon: 'eye' as const },
+  { key: 'Gaming', label: 'Gaming', icon: 'game-controller' as const },
+  { key: 'Historical', label: 'Historical', icon: 'library' as const },
+  { key: 'Original', label: 'Original', icon: 'planet' as const },
+];
 
 interface Character {
   id: string;
@@ -36,13 +32,14 @@ interface Character {
   tagline: string;
   avatar: string;
   genre: string;
+  category?: string;
   chat_count?: number;
-  is_official?: boolean;
+  is_favorited?: boolean;
 }
 
 export default function Discover() {
   const router = useRouter();
-  const [genre, setGenre] = useState('All');
+  const [active, setActive] = useState<string>('Trending');
   const [query, setQuery] = useState('');
   const [characters, setCharacters] = useState<Character[]>([]);
   const [featured, setFeatured] = useState<Character[]>([]);
@@ -51,33 +48,51 @@ export default function Discover() {
 
   const load = useCallback(async () => {
     try {
-      const params = new URLSearchParams();
-      if (genre !== 'All') params.set('genre', genre);
-      if (query.trim()) params.set('search', query.trim());
-      const [list, feat] = await Promise.all([
-        api<{ characters: Character[] }>(`/characters?${params.toString()}`, { auth: false }),
-        api<{ characters: Character[] }>(`/characters/featured`, { auth: false }),
-      ]);
-      setCharacters(list.characters);
-      setFeatured(feat.characters);
+      let chars: Character[] = [];
+      if (active === 'Trending') {
+        const data = await api<{ characters: Character[] }>('/characters/trending');
+        chars = data.characters;
+      } else if (active === 'Favorites') {
+        const data = await api<{ characters: Character[] }>('/characters?favorites_only=true&limit=200');
+        chars = data.characters;
+      } else {
+        const params = new URLSearchParams();
+        if (active !== 'All') params.set('category', active);
+        if (query.trim()) params.set('search', query.trim());
+        const data = await api<{ characters: Character[] }>(`/characters?${params.toString()}`);
+        chars = data.characters;
+      }
+      setCharacters(chars);
+      // Featured only on Trending / All
+      if (active === 'Trending' || active === 'All') {
+        const feat = await api<{ characters: Character[] }>('/characters/featured');
+        setFeatured(feat.characters.slice(0, 6));
+      } else {
+        setFeatured([]);
+      }
     } catch (e) {
       console.warn('load characters', e);
     } finally {
       setLoading(false);
       setRefreshing(false);
     }
-  }, [genre, query]);
+  }, [active, query]);
 
-  useEffect(() => {
-    load();
-  }, [load]);
+  useFocusEffect(useCallback(() => { load(); }, [load]));
 
-  const onRefresh = () => {
-    setRefreshing(true);
-    load();
+  // Reload immediately when category changes (no debounce needed for tab clicks)
+  useEffect(() => { load(); }, [active, load]);
+
+  const onRefresh = () => { setRefreshing(true); load(); };
+  const goCharacter = (id: string) => {
+    Haptics.selectionAsync().catch(() => {});
+    router.push(`/character/${id}`);
   };
 
-  const goCharacter = (id: string) => router.push(`/character/${id}`);
+  const onPickCategory = (key: string) => {
+    Haptics.selectionAsync().catch(() => {});
+    setActive(key);
+  };
 
   return (
     <SafeAreaView style={styles.safe} edges={['top']} testID="discover-screen">
@@ -101,9 +116,41 @@ export default function Discover() {
             placeholderTextColor={Colors.textSecondary}
             style={styles.search}
             returnKeyType="search"
-            onSubmitEditing={load}
+            onSubmitEditing={() => { if (active !== 'Trending' && active !== 'Favorites') load(); else setActive('All'); }}
           />
+          {!!query && (
+            <Pressable onPress={() => { setQuery(''); load(); }} hitSlop={8}>
+              <Ionicons name="close-circle" size={18} color={Colors.textSecondary} />
+            </Pressable>
+          )}
         </View>
+
+        {/* Category tabs */}
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          contentContainerStyle={styles.catRow}
+          style={{ marginTop: Spacing.md }}
+        >
+          {CATEGORIES.map((c) => {
+            const isActive = active === c.key;
+            return (
+              <Pressable
+                key={c.key}
+                testID={`cat-${c.key.toLowerCase()}`}
+                onPress={() => onPickCategory(c.key)}
+                style={[styles.catChip, isActive && styles.catChipActive]}
+              >
+                <Ionicons
+                  name={c.icon}
+                  size={14}
+                  color={isActive ? '#fff' : Colors.textSecondary}
+                />
+                <Text style={[styles.catText, isActive && styles.catTextActive]}>{c.label}</Text>
+              </Pressable>
+            );
+          })}
+        </ScrollView>
 
         {/* Featured carousel */}
         {featured.length > 0 && (
@@ -126,9 +173,14 @@ export default function Discover() {
                     colors={['transparent', 'rgba(13,13,26,0.95)']}
                     style={styles.featuredOverlay}
                   />
+                  {item.is_favorited && (
+                    <View style={styles.heartBadge}>
+                      <Ionicons name="heart" size={14} color={Colors.error} />
+                    </View>
+                  )}
                   <View style={styles.featuredText}>
                     <View style={styles.genrePill}>
-                      <Text style={styles.genrePillText}>{item.genre}</Text>
+                      <Text style={styles.genrePillText}>{item.category || item.genre}</Text>
                     </View>
                     <Text style={styles.featuredName} numberOfLines={1}>{item.name}</Text>
                     <Text style={styles.featuredTag} numberOfLines={2}>{item.tagline}</Text>
@@ -139,44 +191,29 @@ export default function Discover() {
           </View>
         )}
 
-        {/* Genres */}
-        <View style={{ marginTop: Spacing.xl }}>
-          <Text style={styles.sectionTitle}>Browse by genre</Text>
-          <ScrollView
-            horizontal
-            showsHorizontalScrollIndicator={false}
-            contentContainerStyle={{ paddingHorizontal: Spacing.lg, gap: 10 }}
-          >
-            {GENRES.map((g) => {
-              const active = g === genre;
-              return (
-                <Pressable
-                  key={g}
-                  testID={`genre-chip-${g.toLowerCase()}`}
-                  onPress={() => setGenre(g)}
-                  style={[styles.chip, active && styles.chipActive]}
-                >
-                  <Ionicons
-                    name={GENRE_ICONS[g] as any}
-                    size={14}
-                    color={active ? '#fff' : Colors.textSecondary}
-                  />
-                  <Text style={[styles.chipText, active && styles.chipTextActive]}>{g}</Text>
-                </Pressable>
-              );
-            })}
-          </ScrollView>
-        </View>
-
-        {/* List */}
+        {/* Character grid */}
         <View style={{ marginTop: Spacing.xl, paddingHorizontal: Spacing.lg }}>
-          <Text style={styles.sectionTitle2}>
-            {genre === 'All' ? 'All characters' : genre}
-          </Text>
+          <View style={styles.gridHeader}>
+            <Text style={styles.sectionTitle2}>
+              {active === 'Trending' ? '🔥 Trending now' : active === 'Favorites' ? '❤ Your favorites' : active === 'All' ? 'All characters' : active}
+            </Text>
+            <Text style={styles.count}>{characters.length}</Text>
+          </View>
           {loading ? (
             <ActivityIndicator color={Colors.brandPrimary} style={{ marginTop: 24 }} />
           ) : characters.length === 0 ? (
-            <Text style={styles.empty}>No characters yet.</Text>
+            <View style={styles.empty}>
+              <Ionicons
+                name={active === 'Favorites' ? 'heart-outline' : 'search'}
+                size={42}
+                color={Colors.textSecondary}
+              />
+              <Text style={styles.emptyText}>
+                {active === 'Favorites'
+                  ? 'No favorites yet — tap the heart on any character.'
+                  : 'No characters found. Try another category.'}
+              </Text>
+            </View>
           ) : (
             <View style={styles.grid}>
               {characters.map((c) => (
@@ -191,6 +228,11 @@ export default function Discover() {
                     colors={['transparent', 'rgba(13,13,26,0.95)']}
                     style={styles.cardOverlay}
                   />
+                  {c.is_favorited && (
+                    <View style={styles.heartBadgeSmall}>
+                      <Ionicons name="heart" size={11} color={Colors.error} />
+                    </View>
+                  )}
                   <View style={styles.cardText}>
                     <Text style={styles.cardName} numberOfLines={1}>{c.name}</Text>
                     <Text style={styles.cardTag} numberOfLines={2}>{c.tagline}</Text>
@@ -217,8 +259,20 @@ const styles = StyleSheet.create({
     borderWidth: 1, borderColor: Colors.borderDefault,
   },
   search: { flex: 1, color: '#fff', paddingVertical: 12, fontSize: 15 },
+  catRow: { paddingHorizontal: Spacing.lg, gap: 8 },
+  catChip: {
+    flexDirection: 'row', alignItems: 'center', gap: 6,
+    paddingHorizontal: 14, paddingVertical: 9,
+    backgroundColor: Colors.inputBg, borderRadius: Radius.pill,
+    borderWidth: 1, borderColor: Colors.borderDefault,
+  },
+  catChipActive: { backgroundColor: Colors.brandPrimary, borderColor: Colors.brandPrimary },
+  catText: { color: Colors.textSecondary, fontSize: 13, fontWeight: '500' },
+  catTextActive: { color: '#fff' },
   sectionTitle: { color: Colors.textPrimary, fontSize: 18, fontWeight: '700', paddingHorizontal: Spacing.lg, marginBottom: 12 },
-  sectionTitle2: { color: Colors.textPrimary, fontSize: 18, fontWeight: '700', marginBottom: 14 },
+  gridHeader: { flexDirection: 'row', alignItems: 'baseline', justifyContent: 'space-between', marginBottom: 14 },
+  sectionTitle2: { color: Colors.textPrimary, fontSize: 18, fontWeight: '700' },
+  count: { color: Colors.textSecondary, fontSize: 12 },
   featuredCard: {
     width: 260, height: 340, borderRadius: Radius.lg,
     overflow: 'hidden', backgroundColor: Colors.bgSecondary,
@@ -234,15 +288,16 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10, paddingVertical: 4, borderRadius: Radius.pill, marginBottom: 4,
   },
   genrePillText: { color: '#fff', fontSize: 11, fontWeight: '600', letterSpacing: 0.4 },
-  chip: {
-    flexDirection: 'row', alignItems: 'center', gap: 6,
-    paddingHorizontal: 14, paddingVertical: 10,
-    backgroundColor: Colors.inputBg, borderRadius: Radius.pill,
-    borderWidth: 1, borderColor: Colors.borderDefault,
+  heartBadge: {
+    position: 'absolute', top: 10, right: 10,
+    width: 28, height: 28, borderRadius: 14,
+    backgroundColor: 'rgba(0,0,0,0.5)', alignItems: 'center', justifyContent: 'center',
   },
-  chipActive: { backgroundColor: Colors.brandPrimary, borderColor: Colors.brandPrimary },
-  chipText: { color: Colors.textSecondary, fontSize: 13, fontWeight: '500' },
-  chipTextActive: { color: '#fff' },
+  heartBadgeSmall: {
+    position: 'absolute', top: 8, right: 8,
+    width: 22, height: 22, borderRadius: 11,
+    backgroundColor: 'rgba(0,0,0,0.5)', alignItems: 'center', justifyContent: 'center',
+  },
   grid: { flexDirection: 'row', flexWrap: 'wrap', gap: 12, justifyContent: 'space-between' },
   card: {
     width: '48%', aspectRatio: 0.72, borderRadius: Radius.md,
@@ -254,5 +309,6 @@ const styles = StyleSheet.create({
   cardText: { position: 'absolute', left: 12, right: 12, bottom: 12 },
   cardName: { color: '#fff', fontSize: 15, fontWeight: '700' },
   cardTag: { color: Colors.textSecondary, fontSize: 12, lineHeight: 16, marginTop: 2 },
-  empty: { color: Colors.textSecondary, textAlign: 'center', marginTop: 32 },
+  empty: { alignItems: 'center', gap: 12, marginTop: 32, paddingHorizontal: Spacing.lg },
+  emptyText: { color: Colors.textSecondary, fontSize: 14, textAlign: 'center', lineHeight: 20 },
 });

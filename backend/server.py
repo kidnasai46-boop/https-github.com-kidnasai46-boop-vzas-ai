@@ -4,20 +4,20 @@ from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
-import base64
 import httpx
 from pathlib import Path
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import uuid
 from datetime import datetime, timezone, timedelta
 
 from emergentintegrations.llm.chat import LlmChat, UserMessage
 
+from seed_data import SEED_CHARACTERS
+
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# MongoDB connection
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
@@ -32,16 +32,31 @@ logger = logging.getLogger(__name__)
 
 
 # ---------- Models ----------
+class Persona(BaseModel):
+    name: Optional[str] = None
+    age: Optional[str] = None
+    gender: Optional[str] = None
+    bio: Optional[str] = None
+
+
 class User(BaseModel):
     user_id: str
     email: str
     name: str
     picture: Optional[str] = None
+    persona: Persona = Field(default_factory=Persona)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class SessionRequest(BaseModel):
     session_id: str
+
+
+class Scenario(BaseModel):
+    id: str
+    title: str
+    description: str
+    first_message: str
 
 
 class Character(BaseModel):
@@ -52,12 +67,15 @@ class Character(BaseModel):
     personality: str
     backstory: str
     greeting: str
-    avatar: str  # url OR data:image/png;base64,...
+    avatar: str
     genre: str
+    category: str = "Original"
     tags: List[str] = []
-    creator_id: Optional[str] = None  # None for seeded
+    scenarios: List[Scenario] = []
+    creator_id: Optional[str] = None
     is_official: bool = False
     chat_count: int = 0
+    favorite_count: int = 0
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -70,7 +88,9 @@ class CharacterCreate(BaseModel):
     greeting: str
     avatar: str
     genre: str
+    category: Optional[str] = "Original"
     tags: List[str] = []
+    scenarios: List[Scenario] = []
 
 
 class AvatarGenRequest(BaseModel):
@@ -80,7 +100,7 @@ class AvatarGenRequest(BaseModel):
 class Message(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     chat_id: str
-    role: str  # "user" or "assistant"
+    role: str
     content: str
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -89,16 +109,30 @@ class Chat(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     user_id: str
     character_id: str
+    scenario_id: Optional[str] = None
+    scenario_title: Optional[str] = None
     last_message: str = ""
     last_message_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class StartChatRequest(BaseModel):
+    scenario_id: Optional[str] = None
+    fresh: bool = False  # if True, start a NEW chat even if one exists
 
 
 class SendMessageRequest(BaseModel):
     content: str
 
 
-# ---------- Auth helpers ----------
+class PersonaUpdate(BaseModel):
+    name: Optional[str] = None
+    age: Optional[str] = None
+    gender: Optional[str] = None
+    bio: Optional[str] = None
+
+
+# ---------- Auth ----------
 async def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing bearer token")
@@ -117,10 +151,18 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
     return user
 
 
+async def get_current_user_optional(authorization: Optional[str] = Header(None)) -> Optional[dict]:
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    try:
+        return await get_current_user(authorization)
+    except HTTPException:
+        return None
+
+
 # ---------- Auth Endpoints ----------
 @api_router.post("/auth/google")
 async def google_auth(req: SessionRequest):
-    """Verify session_id with Emergent OAuth and create/refresh a session."""
     async with httpx.AsyncClient(timeout=15) as http_client:
         resp = await http_client.get(
             "https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data",
@@ -173,11 +215,31 @@ async def auth_logout(authorization: Optional[str] = Header(None)):
     return {"success": True}
 
 
+@api_router.patch("/auth/me/persona")
+async def update_persona(req: PersonaUpdate, user: dict = Depends(get_current_user)):
+    persona = {k: v for k, v in req.dict().items() if v is not None}
+    await db.users.update_one(
+        {"user_id": user["user_id"]},
+        {"$set": {f"persona.{k}": v for k, v in persona.items()}}
+    )
+    updated = await db.users.find_one({"user_id": user["user_id"]}, {"_id": 0})
+    return {"user": updated}
+
+
 # ---------- Characters ----------
 @api_router.get("/characters")
-async def list_characters(genre: Optional[str] = None, search: Optional[str] = None, limit: int = 100):
-    q = {}
-    if genre and genre.lower() != "all":
+async def list_characters(
+    category: Optional[str] = None,
+    genre: Optional[str] = None,
+    search: Optional[str] = None,
+    favorites_only: bool = False,
+    limit: int = 200,
+    user: Optional[dict] = Depends(get_current_user_optional),
+):
+    q: Dict[str, Any] = {}
+    if category and category.lower() not in ("all", ""):
+        q["category"] = category
+    if genre and genre.lower() not in ("all", ""):
         q["genre"] = genre
     if search:
         q["$or"] = [
@@ -185,14 +247,86 @@ async def list_characters(genre: Optional[str] = None, search: Optional[str] = N
             {"tagline": {"$regex": search, "$options": "i"}},
             {"tags": {"$regex": search, "$options": "i"}},
         ]
+
+    if favorites_only:
+        if not user:
+            raise HTTPException(status_code=401, detail="Login required for favorites")
+        favs = await db.favorites.find({"user_id": user["user_id"]}, {"_id": 0}).to_list(1000)
+        ids = [f["character_id"] for f in favs]
+        if not ids:
+            return {"characters": []}
+        q["id"] = {"$in": ids}
+
     docs = await db.characters.find(q, {"_id": 0}).sort("chat_count", -1).limit(limit).to_list(limit)
+
+    # Mark favorited for current user
+    if user and docs:
+        char_ids = [d["id"] for d in docs]
+        fav_set = {f["character_id"] async for f in db.favorites.find(
+            {"user_id": user["user_id"], "character_id": {"$in": char_ids}},
+            {"_id": 0}
+        )}
+        for d in docs:
+            d["is_favorited"] = d["id"] in fav_set
+    else:
+        for d in docs:
+            d["is_favorited"] = False
+
     return {"characters": docs}
 
 
 @api_router.get("/characters/featured")
-async def featured_characters():
-    docs = await db.characters.find({"is_official": True}, {"_id": 0}).sort("chat_count", -1).limit(6).to_list(6)
+async def featured_characters(user: Optional[dict] = Depends(get_current_user_optional)):
+    docs = await db.characters.find({"is_official": True}, {"_id": 0}).sort("chat_count", -1).limit(8).to_list(8)
+    if user and docs:
+        char_ids = [d["id"] for d in docs]
+        fav_set = {f["character_id"] async for f in db.favorites.find(
+            {"user_id": user["user_id"], "character_id": {"$in": char_ids}}, {"_id": 0}
+        )}
+        for d in docs:
+            d["is_favorited"] = d["id"] in fav_set
+    else:
+        for d in docs:
+            d["is_favorited"] = False
     return {"characters": docs}
+
+
+@api_router.get("/characters/trending")
+async def trending_characters(user: Optional[dict] = Depends(get_current_user_optional)):
+    """Sorted by chat_count + favorite_count, limited to 10."""
+    pipeline = [
+        {"$match": {"is_official": True}},
+        {"$addFields": {"_score": {"$add": [
+            {"$ifNull": ["$chat_count", 0]},
+            {"$multiply": [{"$ifNull": ["$favorite_count", 0]}, 3]},
+        ]}}},
+        {"$sort": {"_score": -1}},
+        {"$limit": 10},
+        {"$project": {"_id": 0, "_score": 0}},
+    ]
+    docs = await db.characters.aggregate(pipeline).to_list(10)
+    if user and docs:
+        char_ids = [d["id"] for d in docs]
+        fav_set = {f["character_id"] async for f in db.favorites.find(
+            {"user_id": user["user_id"], "character_id": {"$in": char_ids}}, {"_id": 0}
+        )}
+        for d in docs:
+            d["is_favorited"] = d["id"] in fav_set
+    else:
+        for d in docs:
+            d["is_favorited"] = False
+    return {"characters": docs}
+
+
+@api_router.get("/characters/categories")
+async def categories():
+    """List of all available categories with counts."""
+    pipeline = [
+        {"$group": {"_id": "$category", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}},
+    ]
+    rows = await db.characters.aggregate(pipeline).to_list(50)
+    return {"categories": [{"name": r["_id"], "count": r["count"]} for r in rows if r["_id"]]}
 
 
 @api_router.get("/characters/mine")
@@ -202,10 +336,15 @@ async def my_characters(user: dict = Depends(get_current_user)):
 
 
 @api_router.get("/characters/{char_id}")
-async def get_character(char_id: str):
+async def get_character(char_id: str, user: Optional[dict] = Depends(get_current_user_optional)):
     c = await db.characters.find_one({"id": char_id}, {"_id": 0})
     if not c:
         raise HTTPException(status_code=404, detail="Character not found")
+    if user:
+        fav = await db.favorites.find_one({"user_id": user["user_id"], "character_id": char_id}, {"_id": 0})
+        c["is_favorited"] = bool(fav)
+    else:
+        c["is_favorited"] = False
     return {"character": c}
 
 
@@ -220,9 +359,32 @@ async def create_character(payload: CharacterCreate, user: dict = Depends(get_cu
     return {"character": char.dict()}
 
 
+@api_router.post("/characters/{char_id}/favorite")
+async def favorite_character(char_id: str, user: dict = Depends(get_current_user)):
+    c = await db.characters.find_one({"id": char_id}, {"_id": 0})
+    if not c:
+        raise HTTPException(status_code=404, detail="Character not found")
+    existing = await db.favorites.find_one({"user_id": user["user_id"], "character_id": char_id})
+    if not existing:
+        await db.favorites.insert_one({
+            "user_id": user["user_id"],
+            "character_id": char_id,
+            "created_at": datetime.now(timezone.utc),
+        })
+        await db.characters.update_one({"id": char_id}, {"$inc": {"favorite_count": 1}})
+    return {"is_favorited": True}
+
+
+@api_router.delete("/characters/{char_id}/favorite")
+async def unfavorite_character(char_id: str, user: dict = Depends(get_current_user)):
+    result = await db.favorites.delete_one({"user_id": user["user_id"], "character_id": char_id})
+    if result.deleted_count:
+        await db.characters.update_one({"id": char_id}, {"$inc": {"favorite_count": -1}})
+    return {"is_favorited": False}
+
+
 @api_router.post("/characters/generate-avatar")
 async def generate_avatar(req: AvatarGenRequest, user: dict = Depends(get_current_user)):
-    """Generate a character avatar using Gemini Nano Banana."""
     try:
         chat = LlmChat(
             api_key=EMERGENT_LLM_KEY,
@@ -230,10 +392,9 @@ async def generate_avatar(req: AvatarGenRequest, user: dict = Depends(get_curren
             system_message="You generate cinematic, fictional character portrait avatars.",
         )
         chat.with_model("gemini", "gemini-3.1-flash-image-preview").with_params(modalities=["image", "text"])
-
         prompt_text = (
             "Cinematic close-up character portrait, fictional persona, no celebrities, "
-            "vertical 1:1 framing, dramatic moody lighting, ultra-detailed, fantasy/sci-fi inspired. "
+            "vertical 1:1 framing, dramatic moody lighting, ultra-detailed. "
             f"Character description: {req.prompt}"
         )
         msg = UserMessage(text=prompt_text)
@@ -242,8 +403,7 @@ async def generate_avatar(req: AvatarGenRequest, user: dict = Depends(get_curren
             raise HTTPException(status_code=500, detail="No image generated")
         img = images[0]
         mime = img.get("mime_type", "image/png")
-        data_uri = f"data:{mime};base64,{img['data']}"
-        return {"avatar": data_uri}
+        return {"avatar": f"data:{mime};base64,{img['data']}"}
     except HTTPException:
         raise
     except Exception as e:
@@ -252,10 +412,74 @@ async def generate_avatar(req: AvatarGenRequest, user: dict = Depends(get_curren
 
 
 # ---------- Chats ----------
+def build_system_prompt(char: dict, user: dict, scenario: Optional[dict]) -> str:
+    persona = user.get("persona") or {}
+    persona_lines = []
+    if persona.get("name"):
+        persona_lines.append(f"- Their name: {persona['name']}")
+    if persona.get("age"):
+        persona_lines.append(f"- Age: {persona['age']}")
+    if persona.get("gender"):
+        persona_lines.append(f"- Gender: {persona['gender']}")
+    if persona.get("bio"):
+        persona_lines.append(f"- About them: {persona['bio']}")
+    persona_block = ""
+    if persona_lines:
+        persona_block = (
+            "\nThe person you are speaking with has shared the following about themselves. "
+            "Naturally incorporate this — refer to them by name when appropriate:\n"
+            + "\n".join(persona_lines) + "\n"
+        )
+
+    scenario_block = ""
+    if scenario:
+        scenario_block = (
+            f"\nCURRENT SCENARIO: {scenario.get('title', '')}\n"
+            f"{scenario.get('description', '')}\n"
+        )
+
+    return (
+        f"You are roleplaying as {char['name']}.\n"
+        f"Tagline: {char.get('tagline', '')}\n"
+        f"Personality: {char.get('personality', '')}\n"
+        f"Backstory: {char.get('backstory', '')}\n"
+        f"{scenario_block}"
+        f"{persona_block}"
+        "Stay fully in character at all times. Respond in first person as this character. "
+        "Keep replies engaging, 1-4 sentences typically, immersive, and emotionally rich. "
+        "Use *italic asterisks* for actions/expressions sparingly. "
+        "Never break character or mention you are an AI. Adapt to the user's narrative direction. Keep content SFW."
+    )
+
+
+async def _generate_assistant_reply(chat_id: str, char: dict, user: dict, scenario: Optional[dict],
+                                    history: List[dict]) -> str:
+    """Replay history through Claude and get a fresh reply. Last message is treated as the new user prompt."""
+    system_message = build_system_prompt(char, user, scenario)
+    try:
+        llm = LlmChat(
+            api_key=EMERGENT_LLM_KEY,
+            session_id=f"chat_{chat_id}_{uuid.uuid4().hex[:8]}",
+            system_message=system_message,
+        ).with_model("anthropic", "claude-sonnet-4-5-20250929")
+
+        prior = history[:-1]
+        for m in prior:
+            if m["role"] == "user":
+                try:
+                    await llm.send_message(UserMessage(text=m["content"]))
+                except Exception:
+                    pass
+        last_user = history[-1]
+        return await llm.send_message(UserMessage(text=last_user["content"]))
+    except Exception:
+        logger.exception("LLM call failed")
+        return "*looks away thoughtfully* Sorry, my mind drifted for a moment. Could you say that again?"
+
+
 @api_router.get("/chats")
 async def list_chats(user: dict = Depends(get_current_user)):
     chats = await db.chats.find({"user_id": user["user_id"]}, {"_id": 0}).sort("last_message_at", -1).to_list(200)
-    # attach character info
     char_ids = list({c["character_id"] for c in chats})
     chars = await db.characters.find({"id": {"$in": char_ids}}, {"_id": 0}).to_list(1000)
     char_map = {c["id"]: c for c in chars}
@@ -265,24 +489,46 @@ async def list_chats(user: dict = Depends(get_current_user)):
 
 
 @api_router.post("/chats/start/{character_id}")
-async def start_chat(character_id: str, user: dict = Depends(get_current_user)):
+async def start_chat(character_id: str, req: Optional[StartChatRequest] = None,
+                     user: dict = Depends(get_current_user)):
+    req = req or StartChatRequest()
     char = await db.characters.find_one({"id": character_id}, {"_id": 0})
     if not char:
         raise HTTPException(status_code=404, detail="Character not found")
 
-    existing = await db.chats.find_one({"user_id": user["user_id"], "character_id": character_id}, {"_id": 0})
-    if existing:
-        return {"chat": existing}
-
-    chat = Chat(user_id=user["user_id"], character_id=character_id, last_message=char.get("greeting", ""))
-    await db.chats.insert_one(dict(chat.dict()))
-
-    # seed greeting message from the character
+    # Default greeting from scenario, if provided
+    scenario = None
     greeting = char.get("greeting") or f"Hi, I'm {char['name']}. Nice to meet you!"
-    greeting_msg = Message(chat_id=chat.id, role="assistant", content=greeting).dict()
+    scenario_title = None
+    if req.scenario_id:
+        for sc in (char.get("scenarios") or []):
+            if sc.get("id") == req.scenario_id:
+                scenario = sc
+                greeting = sc.get("first_message") or greeting
+                scenario_title = sc.get("title")
+                break
+
+    if not req.fresh:
+        existing = await db.chats.find_one(
+            {"user_id": user["user_id"], "character_id": character_id, "scenario_id": req.scenario_id},
+            {"_id": 0},
+        )
+        if existing:
+            return {"chat": existing}
+
+    new_chat = Chat(
+        user_id=user["user_id"],
+        character_id=character_id,
+        scenario_id=req.scenario_id,
+        scenario_title=scenario_title,
+        last_message=greeting[:200],
+    )
+    await db.chats.insert_one(dict(new_chat.dict()))
+
+    greeting_msg = Message(chat_id=new_chat.id, role="assistant", content=greeting).dict()
     await db.messages.insert_one(dict(greeting_msg))
     await db.characters.update_one({"id": character_id}, {"$inc": {"chat_count": 1}})
-    return {"chat": chat.dict()}
+    return {"chat": new_chat.dict()}
 
 
 @api_router.get("/chats/{chat_id}")
@@ -304,43 +550,19 @@ async def send_message(chat_id: str, req: SendMessageRequest, user: dict = Depen
     if not char:
         raise HTTPException(status_code=404, detail="Character not found")
 
-    # Save user message
     user_msg = Message(chat_id=chat_id, role="user", content=req.content).dict()
     await db.messages.insert_one(dict(user_msg))
 
-    # Build conversation history
     history = await db.messages.find({"chat_id": chat_id}, {"_id": 0}).sort("created_at", 1).to_list(1000)
 
-    system_message = (
-        f"You are roleplaying as {char['name']}.\n"
-        f"Tagline: {char.get('tagline', '')}\n"
-        f"Personality: {char.get('personality', '')}\n"
-        f"Backstory: {char.get('backstory', '')}\n"
-        "Stay fully in character at all times. Respond in first person as this character. "
-        "Keep replies engaging, 1-4 sentences typically, immersive, and emotionally rich. "
-        "Never break character or mention you are an AI. Adapt to the user's narrative direction. Keep content SFW."
-    )
+    scenario = None
+    if chat.get("scenario_id"):
+        for sc in (char.get("scenarios") or []):
+            if sc.get("id") == chat["scenario_id"]:
+                scenario = sc
+                break
 
-    try:
-        llm = LlmChat(
-            api_key=EMERGENT_LLM_KEY,
-            session_id=f"chat_{chat_id}",
-            system_message=system_message,
-        ).with_model("anthropic", "claude-sonnet-4-5-20250929")
-
-        # Replay prior messages (skip the just-inserted user message as we'll send it)
-        prior = history[:-1]
-        for m in prior:
-            try:
-                await llm.send_message(UserMessage(text=m["content"])) if m["role"] == "user" else None
-            except Exception:
-                pass
-
-        # Send the new user message
-        reply_text = await llm.send_message(UserMessage(text=req.content))
-    except Exception as e:
-        logger.exception("LLM call failed")
-        reply_text = "*looks away thoughtfully* Sorry, my mind drifted for a moment. Could you say that again?"
+    reply_text = await _generate_assistant_reply(chat_id, char, user, scenario, history)
 
     assistant_msg = Message(chat_id=chat_id, role="assistant", content=reply_text).dict()
     await db.messages.insert_one(dict(assistant_msg))
@@ -351,6 +573,58 @@ async def send_message(chat_id: str, req: SendMessageRequest, user: dict = Depen
     )
 
     return {"user_message": user_msg, "assistant_message": assistant_msg}
+
+
+@api_router.post("/chats/{chat_id}/regenerate")
+async def regenerate_message(chat_id: str, user: dict = Depends(get_current_user)):
+    """Delete the most recent assistant message and generate a new one based on the prior history."""
+    chat = await db.chats.find_one({"id": chat_id, "user_id": user["user_id"]}, {"_id": 0})
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    char = await db.characters.find_one({"id": chat["character_id"]}, {"_id": 0})
+    if not char:
+        raise HTTPException(status_code=404, detail="Character not found")
+
+    # Find the most-recent assistant message
+    last_assistant = await db.messages.find_one(
+        {"chat_id": chat_id, "role": "assistant"},
+        sort=[("created_at", -1)],
+    )
+    if not last_assistant:
+        raise HTTPException(status_code=400, detail="No assistant message to regenerate")
+
+    await db.messages.delete_one({"id": last_assistant["id"]})
+
+    # Rebuild history (now ending at the user message)
+    history = await db.messages.find({"chat_id": chat_id}, {"_id": 0}).sort("created_at", 1).to_list(1000)
+    if not history or history[-1]["role"] != "user":
+        # Was probably the greeting — just give a fresh greeting instead
+        scenario = None
+        if chat.get("scenario_id"):
+            for sc in (char.get("scenarios") or []):
+                if sc.get("id") == chat["scenario_id"]:
+                    scenario = sc
+                    break
+        fresh_greeting = (scenario.get("first_message") if scenario else None) or char.get("greeting", f"Hi, I'm {char['name']}.")
+        new_msg = Message(chat_id=chat_id, role="assistant", content=fresh_greeting).dict()
+        await db.messages.insert_one(dict(new_msg))
+        return {"assistant_message": new_msg}
+
+    scenario = None
+    if chat.get("scenario_id"):
+        for sc in (char.get("scenarios") or []):
+            if sc.get("id") == chat["scenario_id"]:
+                scenario = sc
+                break
+
+    reply_text = await _generate_assistant_reply(chat_id, char, user, scenario, history)
+    new_msg = Message(chat_id=chat_id, role="assistant", content=reply_text).dict()
+    await db.messages.insert_one(dict(new_msg))
+    await db.chats.update_one(
+        {"id": chat_id},
+        {"$set": {"last_message": reply_text[:200], "last_message_at": datetime.now(timezone.utc)}},
+    )
+    return {"assistant_message": new_msg}
 
 
 @api_router.delete("/chats/{chat_id}")
@@ -378,161 +652,25 @@ app.add_middleware(
 )
 
 
-# ---------- Seed data ----------
-SEED_CHARACTERS = [
-    {
-        "name": "Lyra Ashenvale",
-        "tagline": "An elven sorceress with secrets older than the moon.",
-        "description": "Last heir of the Ashenvale line, Lyra wanders forgotten kingdoms in search of a way to break her bloodline's curse.",
-        "personality": "Mysterious, wise, gently flirtatious, fiercely loyal once trust is earned. Speaks in poetic, archaic cadence.",
-        "backstory": "Raised in the silver groves of Ashenvale, Lyra watched her kin fall to a slow magical decay. She studies forbidden tomes and ancient artifacts in the hope of saving her people.",
-        "greeting": "*lowers her hood, eyes glimmering like cold starlight* You've wandered far from any safe road, traveler. Tell me — what brings a soul like yours to my forest?",
-        "avatar": "https://images.unsplash.com/photo-1440589473619-3cde28941638?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1NzB8MHwxfHNlYXJjaHwzfHxjaW5lbWF0aWMlMjBwb3J0cmFpdCUyMGZhbnRhc3l8ZW58MHx8fHwxNzc5NTU5NTQ3fDA&ixlib=rb-4.1.0&q=85",
-        "genre": "Fantasy",
-        "tags": ["sorceress", "mystery", "ancient", "roleplay"],
-    },
-    {
-        "name": "Saoirse the Wanderer",
-        "tagline": "A road-worn ranger who's seen every horizon worth seeing.",
-        "description": "Trail-hardened scout-for-hire. She knows the safe paths, the deadly ones, and the ones nobody talks about.",
-        "personality": "Calm, dry-witted, observant, fiercely independent but quietly warm to those she trusts.",
-        "backstory": "Orphaned at twelve, raised by a wandering hunter, Saoirse now sells her skill to caravans crossing the eastern wilds.",
-        "greeting": "*kicks dirt over the embers* You found my camp. Either you're lost or you've got business. Which is it?",
-        "avatar": "https://images.unsplash.com/photo-1574244931790-ee19df716899?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1NzB8MHwxfHNlYXJjaHw0fHxjaW5lbWF0aWMlMjBwb3J0cmFpdCUyMGZhbnRhc3l8ZW58MHx8fHwxNzc5NTU5NTQ3fDA&ixlib=rb-4.1.0&q=85",
-        "genre": "Adventure",
-        "tags": ["ranger", "wilderness", "travel", "stoic"],
-    },
-    {
-        "name": "Ember Hollow",
-        "tagline": "Hooded stranger trading whispers and warnings in equal measure.",
-        "description": "Nobody knows where Ember came from. They appear at crossroads, offer a riddle or a deal, and vanish before dawn.",
-        "personality": "Cryptic, playful, slightly dangerous. Loves to test mortals with paradoxes.",
-        "backstory": "A spirit-touched soul tethered between worlds — bound by an old promise to guide certain wanderers, harm others.",
-        "greeting": "*from beneath the hood, a smile* You have a question burning in you. I can taste it. Ask — but choose carefully.",
-        "avatar": "https://images.pexels.com/photos/29376153/pexels-photo-29376153.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
-        "genre": "Mystery",
-        "tags": ["mystery", "riddles", "spirit", "cryptic"],
-    },
-    {
-        "name": "Marlowe Voss",
-        "tagline": "A jazz-era detective with a cigarette habit and a soft spot for trouble.",
-        "description": "Hardboiled private eye working the rain-slick streets of a city that never quite goes to sleep.",
-        "personality": "World-weary, sardonic, observant, secretly idealistic underneath the cynicism.",
-        "backstory": "Ex-cop turned private investigator after a case went sideways and cost him his badge. Now he chases truth one cigarette at a time.",
-        "greeting": "*leans back, exhales smoke* You walk into my office at this hour, dame, you've already got a story. Sit down. Talk.",
-        "avatar": "https://images.pexels.com/photos/27362449/pexels-photo-27362449.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
-        "genre": "Drama",
-        "tags": ["detective", "noir", "mystery", "drama"],
-    },
-    {
-        "name": "Nova Cypher",
-        "tagline": "Rogue netrunner, ice-blue hair, ice-cold smile.",
-        "description": "Top-tier hacker for hire in the neon underbelly of Neo-Kyoto. If the data exists, Nova can find it — for a price.",
-        "personality": "Confident, sharp-tongued, secretly loyal. Tech-savvy, dismissive of corporate types.",
-        "backstory": "Raised in the megacity's lower decks, Nova taught herself to code by jacking abandoned net-nodes. Now she's on three corp blacklists.",
-        "greeting": "*spins the chair toward you, neon flickering across her face* Well, well. Either you're a fed or you've got creds. Show me which.",
-        "avatar": "https://images.unsplash.com/flagged/photo-1579451442952-f0365f3f0aed?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzNTl8MHwxfHNlYXJjaHwzfHxjaW5lbWF0aWMlMjBwb3J0cmFpdCUyMGN5YmVycHVuayUyMG5lb258ZW58MHx8fHwxNzc5NTU5NTQ3fDA&ixlib=rb-4.1.0&q=85",
-        "genre": "Sci-Fi",
-        "tags": ["cyberpunk", "hacker", "neon", "rebel"],
-    },
-    {
-        "name": "Kael Renn",
-        "tagline": "Disgraced starship pilot with one last debt to pay.",
-        "description": "Once the youngest captain in the Fleet, Kael now flies whatever pays the bills across the outer rim.",
-        "personality": "Brooding, witty, principled in his own crooked way. Drinks too much, sleeps too little.",
-        "backstory": "Court-martialed for refusing an order he believed unjust, Kael lost his rank, his crew, and his name in the records. He's been chasing redemption ever since.",
-        "greeting": "*finishes his drink and pushes the empty glass aside* You're the contact, huh? Sit down. Don't talk loud. And don't waste my time.",
-        "avatar": "https://images.unsplash.com/flagged/photo-1579451443170-44b3963c3341?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzNTl8MHwxfHNlYXJjaHw0fHxjaW5lbWF0aWMlMjBwb3J0cmFpdCUyMGN5YmVycHVuayUyMG5lb258ZW58MHx8fHwxNzc5NTU5NTQ3fDA&ixlib=rb-4.1.0&q=85",
-        "genre": "Sci-Fi",
-        "tags": ["pilot", "space", "redemption", "antihero"],
-    },
-    {
-        "name": "Ronan Vex",
-        "tagline": "Black-market broker who's heard every secret and kept most of them.",
-        "description": "He runs the back-room of the city's most exclusive lounge. Everyone owes him a favor. Eventually, you will too.",
-        "personality": "Charming, calculating, dangerously polite. Always smiling, never warm.",
-        "backstory": "Started running messages as a kid, now sits at the top of an invisible network of influence in the upper city.",
-        "greeting": "*slides a glass across the bar* On the house. Now — what is it you really came for?",
-        "avatar": "https://images.unsplash.com/photo-1627589161730-0d90bea5a656?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzNTl8MHwxfHNlYXJjaHwyfHxjaW5lbWF0aWMlMjBwb3J0cmFpdCUyMGN5YmVycHVuayUyMG5lb258ZW58MHx8fHwxNzc5NTU5NTQ3fDA&ixlib=rb-4.1.0&q=85",
-        "genre": "Drama",
-        "tags": ["broker", "noir", "secrets", "intrigue"],
-    },
-    {
-        "name": "Iris Wraithwood",
-        "tagline": "A medium who hears the city's restless dead.",
-        "description": "She's the one detectives call when the case stops making sense.",
-        "personality": "Soft-spoken, perceptive, kind-hearted but unflinching. Carries the weight of every voice she's heard.",
-        "backstory": "Iris discovered her gift at sixteen when her late grandmother begged her to finish unsaid words. She's been listening ever since.",
-        "greeting": "*closes her eyes for a moment, then opens them* Someone followed you here. Don't worry — they're not angry. Sit. Tell me your name.",
-        "avatar": "https://images.unsplash.com/photo-1634733049839-0292be607569?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzMzJ8MHwxfHNlYXJjaHwzfHxjaW5lbWF0aWMlMjBwb3J0cmFpdCUyMG15c3RlcnklMjBkcmFtYXRpY3xlbnwwfHx8fDE3Nzk1NTk1NDd8MA&ixlib=rb-4.1.0&q=85",
-        "genre": "Mystery",
-        "tags": ["medium", "supernatural", "thriller", "empath"],
-    },
-    {
-        "name": "Theo Marchetti",
-        "tagline": "Reluctant heir to a crumbling old-money empire.",
-        "description": "Public face: charming socialite. Private truth: he'd burn the whole estate to be free of it.",
-        "personality": "Charismatic, conflicted, sharp-tongued, deeply loyal to the very few he loves.",
-        "backstory": "Eldest son of the Marchetti family, expected to inherit a tangled business empire he never wanted any part of.",
-        "greeting": "*loosens his tie, smirks* You caught me on a good day. Or a bad one — it's hard to tell anymore. What do you want to know?",
-        "avatar": "https://images.unsplash.com/photo-1711464669343-2596d0f1b526?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzMzJ8MHwxfHNlYXJjaHw0fHxjaW5lbWF0aWMlMjBwb3J0cmFpdCUyMG15c3RlcnklMjBkcmFtYXRpY3xlbnwwfHx8fDE3Nzk1NTk1NDd8MA&ixlib=rb-4.1.0&q=85",
-        "genre": "Drama",
-        "tags": ["heir", "drama", "romance", "secrets"],
-    },
-    {
-        "name": "Vera Solenne",
-        "tagline": "Opera singer by night, spy by every other hour.",
-        "description": "Her voice has made empires weep. Her silence has ended wars.",
-        "personality": "Elegant, intelligent, magnetic, secretly tired of pretending. Speaks in measured, deliberate sentences.",
-        "backstory": "Recruited from a music conservatory at twenty-two, Vera has lived a double life on every continent.",
-        "greeting": "*sets the wine glass down without a sound* You've been watching me all evening. I'd rather we just speak honestly. What do you want?",
-        "avatar": "https://images.unsplash.com/photo-1496203695688-3b8985780d6a?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzMzJ8MHwxfHNlYXJjaHwyfHxjaW5lbWF0aWMlMjBwb3J0cmFpdCUyMG15c3RlcnklMjBkcmFtYXRpY3xlbnwwfHx8fDE3Nzk1NTk1NDd8MA&ixlib=rb-4.1.0&q=85",
-        "genre": "Mystery",
-        "tags": ["spy", "elegance", "intrigue", "femmefatale"],
-    },
-    {
-        "name": "Juno Adair",
-        "tagline": "A florist with poetry in her hands and storms in her heart.",
-        "description": "Owner of a tiny rain-streaked shop where every bouquet seems to know exactly what you needed to hear.",
-        "personality": "Warm, dreamy, quietly observant, romantic at heart, brave when it matters.",
-        "backstory": "She inherited the shop from her grandmother, along with a journal full of letters never sent.",
-        "greeting": "*wipes her hands on her apron, smiling softly* You walked in for a reason, even if you don't know it yet. Tell me — who is the bouquet for?",
-        "avatar": "https://images.unsplash.com/photo-1775179182715-61dd143f7899?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjY2NzN8MHwxfHNlYXJjaHwzfHxjaW5lbWF0aWMlMjBwb3J0cmFpdCUyMHJvbWFudGljJTIwc29mdHxlbnwwfHx8fDE3Nzk1NTk1NDZ8MA&ixlib=rb-4.1.0&q=85",
-        "genre": "Romance",
-        "tags": ["romance", "slowburn", "soft", "cozy"],
-    },
-    {
-        "name": "Eliza & Henry",
-        "tagline": "A pair of star-crossed dancers from a forgotten era.",
-        "description": "Two ballroom dancers caught between a great love and a greater duty in 1920s Paris.",
-        "personality": "Polished on the surface, achingly tender underneath. They speak with old-world grace and quiet longing.",
-        "backstory": "Once partners on stage, separated by war. Now reunited in the back room of a Parisian dance hall, deciding whether to begin again.",
-        "greeting": "*the music slows, Henry offers his hand* One dance. Then you can tell me everything you've been holding back.",
-        "avatar": "https://images.pexels.com/photos/6719065/pexels-photo-6719065.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
-        "genre": "Romance",
-        "tags": ["vintage", "romance", "drama", "duo"],
-    },
-    {
-        "name": "Princess Aurelia",
-        "tagline": "A young queen-to-be sneaking out of her own palace.",
-        "description": "Heir to a fading kingdom, Aurelia wants one night where no one knows her crown.",
-        "personality": "Bright, curious, impulsive, kind-hearted, secretly terrified of the throne waiting for her.",
-        "backstory": "Raised behind palace walls, she's read about freedom in a hundred books — and tonight, she's finally going to live it.",
-        "greeting": "*pulls back her hood, lantern-light flickering across her crown* Don't bow. Please. Tonight I just want to be someone — anyone — else.",
-        "avatar": "https://images.unsplash.com/photo-1763744068529-7f73c3a209f4?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjY2NzN8MHwxfHNlYXJjaHwxfHxjaW5lbWF0aWMlMjBwb3J0cmFpdCUyMHJvbWFudGljJTIwc29mdHxlbnwwfHx8fDE3Nzk1NTk1NDZ8MA&ixlib=rb-4.1.0&q=85",
-        "genre": "Fantasy",
-        "tags": ["royalty", "romance", "fantasy", "adventure"],
-    },
-]
-
-
+# ---------- Seed ----------
 async def seed_data():
-    count = await db.characters.count_documents({"is_official": True})
-    if count >= len(SEED_CHARACTERS):
-        return
     for ch in SEED_CHARACTERS:
-        exists = await db.characters.find_one({"name": ch["name"], "is_official": True}, {"_id": 0})
-        if exists:
+        existing = await db.characters.find_one({"name": ch["name"], "is_official": True}, {"_id": 0})
+        if existing:
+            # Update with any new fields (category, scenarios, tags) without changing chat_count/favorite_count
+            update = {
+                "tagline": ch["tagline"],
+                "description": ch["description"],
+                "personality": ch["personality"],
+                "backstory": ch["backstory"],
+                "greeting": ch["greeting"],
+                "avatar": ch["avatar"],
+                "genre": ch["genre"],
+                "category": ch["category"],
+                "tags": ch["tags"],
+                "scenarios": ch.get("scenarios", []),
+            }
+            await db.characters.update_one({"id": existing["id"]}, {"$set": update})
             continue
         doc = Character(**ch, is_official=True).dict()
         await db.characters.insert_one(dict(doc))
@@ -541,7 +679,6 @@ async def seed_data():
 
 @app.on_event("startup")
 async def on_startup():
-    # Create indexes
     try:
         await db.users.create_index("email", unique=True)
         await db.users.create_index("user_id", unique=True)
@@ -550,8 +687,11 @@ async def on_startup():
         await db.user_sessions.create_index("expires_at", expireAfterSeconds=0)
         await db.characters.create_index("id", unique=True)
         await db.characters.create_index("genre")
+        await db.characters.create_index("category")
         await db.chats.create_index([("user_id", 1), ("last_message_at", -1)])
         await db.messages.create_index([("chat_id", 1), ("created_at", 1)])
+        await db.favorites.create_index([("user_id", 1), ("character_id", 1)], unique=True)
+        await db.favorites.create_index("character_id")
     except Exception as e:
         logger.warning(f"Index creation: {e}")
     await seed_data()

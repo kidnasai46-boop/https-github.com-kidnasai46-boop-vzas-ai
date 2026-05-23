@@ -1,33 +1,44 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   View, Text, StyleSheet, FlatList, TextInput, Pressable, Image,
-  KeyboardAvoidingView, Platform, ActivityIndicator,
+  KeyboardAvoidingView, Platform, ActivityIndicator, Alert,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { useLocalSearchParams, useRouter } from 'expo-router';
+import * as Haptics from 'expo-haptics';
 
 import { Colors, Radius, Spacing } from '@/src/theme/colors';
 import { api } from '@/src/api/client';
 
-interface Msg { id: string; role: 'user' | 'assistant'; content: string; created_at?: string; }
+interface Msg {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  created_at?: string;
+  _streaming?: boolean; // local-only flag for word-reveal
+}
 interface Character { id: string; name: string; avatar: string; tagline: string; }
+interface Chat { id: string; scenario_title?: string | null; }
 
 export default function ChatScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const router = useRouter();
   const [messages, setMessages] = useState<Msg[]>([]);
   const [character, setCharacter] = useState<Character | null>(null);
+  const [chat, setChat] = useState<Chat | null>(null);
   const [loading, setLoading] = useState(true);
   const [draft, setDraft] = useState('');
   const [sending, setSending] = useState(false);
+  const [regenIdx, setRegenIdx] = useState<number | null>(null);
   const listRef = useRef<FlatList<Msg>>(null);
 
   const load = useCallback(async () => {
     if (!id) return;
     try {
-      const data = await api<{ messages: Msg[]; character: Character }>(`/chats/${id}`);
+      const data = await api<{ messages: Msg[]; character: Character; chat: Chat }>(`/chats/${id}`);
       setCharacter(data.character);
+      setChat(data.chat);
       setMessages(data.messages);
     } catch (e) {
       console.warn(e);
@@ -38,15 +49,30 @@ export default function ChatScreen() {
 
   useEffect(() => { load(); }, [load]);
 
+  // Reveal a final assistant message word-by-word for streaming feel
+  const revealStream = (finalText: string, replaceId: string) => {
+    setMessages((m) => m.map((mm) => mm.id === replaceId ? { ...mm, content: '', _streaming: true } : mm));
+    const words = finalText.split(/(\s+)/); // keep whitespace tokens
+    let i = 0;
+    const tick = () => {
+      i = Math.min(i + 2, words.length); // 2 tokens per tick = fast but visible
+      const partial = words.slice(0, i).join('');
+      setMessages((m) => m.map((mm) => mm.id === replaceId ? { ...mm, content: partial } : mm));
+      if (i < words.length) {
+        setTimeout(tick, 28);
+      } else {
+        setMessages((m) => m.map((mm) => mm.id === replaceId ? { ...mm, _streaming: false } : mm));
+      }
+    };
+    tick();
+  };
+
   const send = async () => {
     const text = draft.trim();
     if (!text || sending) return;
     setDraft('');
-    const optimistic: Msg = {
-      id: `tmp_${Date.now()}`,
-      role: 'user',
-      content: text,
-    };
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
+    const optimistic: Msg = { id: `tmp_${Date.now()}`, role: 'user', content: text };
     setMessages((m) => [...m, optimistic]);
     setSending(true);
     setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 50);
@@ -55,18 +81,48 @@ export default function ChatScreen() {
         `/chats/${id}/messages`,
         { method: 'POST', body: { content: text }, timeoutMs: 90000 },
       );
+      const placeholderId = data.assistant_message.id;
       setMessages((m) => [
         ...m.filter((mm) => mm.id !== optimistic.id),
         data.user_message,
-        data.assistant_message,
+        { ...data.assistant_message, content: '', _streaming: true },
       ]);
       setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 50);
+      revealStream(data.assistant_message.content, placeholderId);
     } catch (e) {
-      // Re-show draft if failed
       setMessages((m) => m.filter((mm) => mm.id !== optimistic.id));
       setDraft(text);
+      Alert.alert('Could not send message', 'Please try again.');
     } finally {
       setSending(false);
+    }
+  };
+
+  const regenerate = async () => {
+    if (sending || regenIdx !== null) return;
+    // Find the last assistant message index
+    let lastIdx = -1;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === 'assistant') { lastIdx = i; break; }
+    }
+    if (lastIdx < 0) return;
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => {});
+    setRegenIdx(lastIdx);
+    try {
+      const data = await api<{ assistant_message: Msg }>(
+        `/chats/${id}/regenerate`,
+        { method: 'POST', timeoutMs: 90000 },
+      );
+      setMessages((m) => {
+        const next = [...m];
+        next[lastIdx] = { ...data.assistant_message, content: '', _streaming: true };
+        return next;
+      });
+      revealStream(data.assistant_message.content, data.assistant_message.id);
+    } catch (e) {
+      Alert.alert('Could not regenerate', 'Please try again.');
+    } finally {
+      setRegenIdx(null);
     }
   };
 
@@ -74,6 +130,12 @@ export default function ChatScreen() {
     return (
       <View style={styles.center}><ActivityIndicator color={Colors.brandPrimary} size="large" /></View>
     );
+  }
+
+  // Index of last assistant message (for showing regen button only on the latest)
+  let lastAssistantIdx = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === 'assistant' && !messages[i]._streaming) { lastAssistantIdx = i; break; }
   }
 
   return (
@@ -88,9 +150,11 @@ export default function ChatScreen() {
             onPress={() => router.push(`/character/${character.id}`)}
           >
             <Image source={{ uri: character.avatar }} style={styles.charAvatar} />
-            <View>
+            <View style={{ flex: 1 }}>
               <Text style={styles.charName}>{character.name}</Text>
-              <Text style={styles.charStatus}>online · in character</Text>
+              <Text style={styles.charStatus} numberOfLines={1}>
+                {chat?.scenario_title ? `📖 ${chat.scenario_title}` : 'online · in character'}
+              </Text>
             </View>
           </Pressable>
         )}
@@ -100,21 +164,40 @@ export default function ChatScreen() {
       <KeyboardAvoidingView
         style={{ flex: 1 }}
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-        keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 0}
       >
         <FlatList
           ref={listRef}
           data={messages}
           keyExtractor={(m) => m.id}
           contentContainerStyle={{ padding: Spacing.lg, paddingBottom: Spacing.md, gap: 10 }}
-          renderItem={({ item }) => (
-            <View
-              testID={`msg-${item.role}`}
-              style={[styles.bubble, item.role === 'user' ? styles.bubbleUser : styles.bubbleAssistant]}
-            >
-              <Text style={item.role === 'user' ? styles.userText : styles.assistantText}>
-                {item.content}
-              </Text>
+          renderItem={({ item, index }) => (
+            <View>
+              <View
+                testID={`msg-${item.role}`}
+                style={[styles.bubble, item.role === 'user' ? styles.bubbleUser : styles.bubbleAssistant]}
+              >
+                <Text style={item.role === 'user' ? styles.userText : styles.assistantText}>
+                  {item.content}
+                  {item._streaming && <Text style={styles.cursor}>▌</Text>}
+                </Text>
+              </View>
+              {item.role === 'assistant' && index === lastAssistantIdx && index > 0 && (
+                <View style={styles.msgActions}>
+                  <Pressable
+                    testID="msg-regen-btn"
+                    onPress={regenerate}
+                    style={styles.msgAction}
+                    disabled={regenIdx !== null}
+                  >
+                    {regenIdx !== null ? (
+                      <ActivityIndicator size="small" color={Colors.textSecondary} />
+                    ) : (
+                      <Ionicons name="refresh" size={14} color={Colors.textSecondary} />
+                    )}
+                    <Text style={styles.msgActionText}>Regenerate</Text>
+                  </Pressable>
+                </View>
+              )}
             </View>
           )}
           onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: false })}
@@ -166,9 +249,7 @@ const styles = StyleSheet.create({
   charAvatar: { width: 38, height: 38, borderRadius: 19 },
   charName: { color: '#fff', fontSize: 15, fontWeight: '700' },
   charStatus: { color: Colors.success, fontSize: 11, marginTop: 2 },
-  bubble: {
-    maxWidth: '85%', paddingHorizontal: 14, paddingVertical: 10,
-  },
+  bubble: { maxWidth: '85%', paddingHorizontal: 14, paddingVertical: 10 },
   bubbleUser: {
     alignSelf: 'flex-end',
     backgroundColor: Colors.brandPrimary,
@@ -184,6 +265,15 @@ const styles = StyleSheet.create({
   },
   userText: { color: '#fff', fontSize: 15, lineHeight: 21 },
   assistantText: { color: Colors.textPrimary, fontSize: 15, lineHeight: 21 },
+  cursor: { color: Colors.brandPrimary, fontWeight: '700' },
+  msgActions: { flexDirection: 'row', marginTop: 4, marginLeft: 4, gap: 8 },
+  msgAction: {
+    flexDirection: 'row', alignItems: 'center', gap: 5,
+    paddingHorizontal: 10, paddingVertical: 5,
+    backgroundColor: Colors.inputBg, borderRadius: Radius.pill,
+    borderWidth: 1, borderColor: Colors.borderDefault,
+  },
+  msgActionText: { color: Colors.textSecondary, fontSize: 11, fontWeight: '500' },
   composer: {
     flexDirection: 'row', alignItems: 'flex-end', gap: 8,
     paddingHorizontal: 12, paddingTop: 8, paddingBottom: Platform.OS === 'ios' ? 4 : 10,
