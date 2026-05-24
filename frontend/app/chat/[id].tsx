@@ -10,13 +10,26 @@ import * as Haptics from 'expo-haptics';
 
 import { Colors, Radius, Spacing } from '@/src/theme/colors';
 import { api } from '@/src/api/client';
+import { MeterBar } from '@/src/components/MeterBar';
+import { ChapterCard, EndingCard } from '@/src/components/ChapterCard';
 
 interface Msg {
   id: string;
-  role: 'user' | 'assistant';
+  role: 'user' | 'assistant' | 'system';
   content: string;
   created_at?: string;
-  _streaming?: boolean; // local-only flag for word-reveal
+  _streaming?: boolean;
+  type?: string;
+  chapter_summary?: string;
+  meters_snapshot?: { trust: number; affection: number; rivalry: number; fear: number };
+}
+interface StoryState {
+  chapter: number;
+  total_chapters: number;
+  meters: { trust: number; affection: number; rivalry: number; fear: number };
+  ending: string | null;
+  completed: boolean;
+  arc_title: string;
 }
 interface Character { id: string; name: string; avatar: string; tagline: string; }
 interface Chat { id: string; scenario_title?: string | null; }
@@ -31,6 +44,7 @@ export default function ChatScreen() {
   const [draft, setDraft] = useState('');
   const [sending, setSending] = useState(false);
   const [regenIdx, setRegenIdx] = useState<number | null>(null);
+  const [storyState, setStoryState] = useState<StoryState | null>(null);
   const listRef = useRef<FlatList<Msg>>(null);
 
   const load = useCallback(async () => {
@@ -40,6 +54,9 @@ export default function ChatScreen() {
       setCharacter(data.character);
       setChat(data.chat);
       setMessages(data.messages);
+      if ((data.chat as any)?.story_state) {
+        setStoryState((data.chat as any).story_state);
+      }
     } catch (e) {
       console.warn(e);
     } finally {
@@ -77,16 +94,27 @@ export default function ChatScreen() {
     setSending(true);
     setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 50);
     try {
-      const data = await api<{ user_message: Msg; assistant_message: Msg }>(
+      const data = await api<{ user_message: Msg; assistant_message: Msg; story_state?: any }>(
         `/chats/${id}/messages`,
         { method: 'POST', body: { content: text }, timeoutMs: 90000 },
       );
       const placeholderId = data.assistant_message.id;
-      setMessages((m) => [
-        ...m.filter((mm) => mm.id !== optimistic.id),
-        data.user_message,
-        { ...data.assistant_message, content: '', _streaming: true },
-      ]);
+      const newMsgs: Msg[] = [data.user_message];
+      if (data.story_state) {
+        setStoryState((prev) => prev ? { ...prev, ...data.story_state } : null);
+        if (data.story_state.chapter_transition) {
+          newMsgs.push({
+            id: `transition_${Date.now()}`,
+            role: 'system',
+            content: data.story_state.chapter_transition.title,
+            type: 'chapter_transition',
+            chapter_summary: data.story_state.chapter_transition.summary,
+            meters_snapshot: data.story_state.meters,
+          });
+        }
+      }
+      newMsgs.push({ ...data.assistant_message, content: '', _streaming: true });
+      setMessages((m) => [...m.filter((mm) => mm.id !== optimistic.id), ...newMsgs]);
       setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 50);
       revealStream(data.assistant_message.content, placeholderId);
     } catch (e) {
@@ -153,13 +181,19 @@ export default function ChatScreen() {
             <View style={{ flex: 1 }}>
               <Text style={styles.charName}>{character.name}</Text>
               <Text style={styles.charStatus} numberOfLines={1}>
-                {chat?.scenario_title ? `📖 ${chat.scenario_title}` : 'online · in character'}
+                {storyState && !storyState.completed
+                  ? `Ch. ${storyState.chapter}/${storyState.total_chapters} · ${storyState.arc_title}`
+                  : chat?.scenario_title ? `📖 ${chat.scenario_title}` : 'online · in character'}
               </Text>
             </View>
           </Pressable>
         )}
         <View style={{ width: 40 }} />
       </View>
+
+      {storyState && !storyState.completed && (
+        <MeterBar meters={storyState.meters} />
+      )}
 
       <KeyboardAvoidingView
         style={{ flex: 1 }}
@@ -170,36 +204,44 @@ export default function ChatScreen() {
           data={messages}
           keyExtractor={(m) => m.id}
           contentContainerStyle={{ padding: Spacing.lg, paddingBottom: Spacing.md, gap: 10 }}
-          renderItem={({ item, index }) => (
-            <View>
-              <View
-                testID={`msg-${item.role}`}
-                style={[styles.bubble, item.role === 'user' ? styles.bubbleUser : styles.bubbleAssistant]}
-              >
-                <Text style={item.role === 'user' ? styles.userText : styles.assistantText}>
-                  {item.content}
-                  {item._streaming && <Text style={styles.cursor}>▌</Text>}
-                </Text>
-              </View>
-              {item.role === 'assistant' && index === lastAssistantIdx && index > 0 && (
-                <View style={styles.msgActions}>
-                  <Pressable
-                    testID="msg-regen-btn"
-                    onPress={regenerate}
-                    style={styles.msgAction}
-                    disabled={regenIdx !== null}
-                  >
-                    {regenIdx !== null ? (
-                      <ActivityIndicator size="small" color={Colors.textSecondary} />
-                    ) : (
-                      <Ionicons name="refresh" size={14} color={Colors.textSecondary} />
-                    )}
-                    <Text style={styles.msgActionText}>Regenerate</Text>
-                  </Pressable>
+          renderItem={({ item, index }) => {
+            if (item.type === 'chapter_transition') {
+              if (storyState?.completed && storyState?.ending) {
+                return <EndingCard endingType={storyState.ending} summary={item.chapter_summary || item.content} />;
+              }
+              return <ChapterCard transition={{ title: item.content, summary: item.chapter_summary || '' }} />;
+            }
+            return (
+              <View>
+                <View
+                  testID={`msg-${item.role}`}
+                  style={[styles.bubble, item.role === 'user' ? styles.bubbleUser : styles.bubbleAssistant]}
+                >
+                  <Text style={item.role === 'user' ? styles.userText : styles.assistantText}>
+                    {item.content}
+                    {item._streaming && <Text style={styles.cursor}>▌</Text>}
+                  </Text>
                 </View>
-              )}
-            </View>
-          )}
+                {item.role === 'assistant' && index === lastAssistantIdx && index > 0 && (
+                  <View style={styles.msgActions}>
+                    <Pressable
+                      testID="msg-regen-btn"
+                      onPress={regenerate}
+                      style={styles.msgAction}
+                      disabled={regenIdx !== null}
+                    >
+                      {regenIdx !== null ? (
+                        <ActivityIndicator size="small" color={Colors.textSecondary} />
+                      ) : (
+                        <Ionicons name="refresh" size={14} color={Colors.textSecondary} />
+                      )}
+                      <Text style={styles.msgActionText}>Regenerate</Text>
+                    </Pressable>
+                  </View>
+                )}
+              </View>
+            );
+          }}
           onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: false })}
           ListFooterComponent={
             sending ? (
