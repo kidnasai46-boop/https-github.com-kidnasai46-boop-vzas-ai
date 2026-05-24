@@ -13,6 +13,7 @@ interface ChatItem {
   last_message: string;
   last_message_at: string;
   character?: { name: string; avatar: string; tagline: string };
+  story_state?: { chapter: number; total_chapters: number; completed: boolean; ending: string | null };
 }
 
 export default function Chats() {
@@ -88,7 +89,16 @@ export default function Chats() {
             >
               <Image source={{ uri: item.character?.avatar }} style={styles.avatar} />
               <View style={{ flex: 1 }}>
-                <Text style={styles.name} numberOfLines={1}>{item.character?.name}</Text>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                  <Text style={styles.name} numberOfLines={1}>{item.character?.name}</Text>
+                  {item.story_state && (
+                    <Text style={{ color: Colors.brandPrimary, fontSize: 11, fontWeight: '600' }}>
+                      {item.story_state.completed
+                        ? `✓ ${(item.story_state.ending || 'done').charAt(0).toUpperCase() + (item.story_state.ending || 'done').slice(1)} Ending`
+                        : `Ch. ${item.story_state.chapter}/${item.story_state.total_chapters}`}
+                    </Text>
+                  )}
+                </View>
                 <Text style={styles.last} numberOfLines={1}>
                   {item.last_message || item.character?.tagline}
                 </Text>
