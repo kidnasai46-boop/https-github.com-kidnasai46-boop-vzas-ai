@@ -57,6 +57,21 @@ A = {
     # Gaming
     "game_f1": "https://images.unsplash.com/photo-1542751371-adc38448a05e?w=700",
     "game_m1": "https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=700",
+
+    # Horror
+    "horror_f1": "https://images.unsplash.com/photo-1634733049839-0292be607569?w=700",
+    "horror_m1": "https://images.unsplash.com/photo-1711464669343-2596d0f1b526?w=700",
+    "horror_neutral": "https://images.pexels.com/photos/29376153/pexels-photo-29376153.jpeg?auto=compress&cs=tinysrgb&w=700",
+
+    # Comedy
+    "comedy_m1": "https://images.unsplash.com/photo-1568602471122-7832951cc4c5?w=700",
+    "comedy_f1": "https://images.unsplash.com/photo-1438761681033-6461ffad8d80?w=700",
+    "comedy_m2": "https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=700",
+
+    # Slice of Life
+    "slice_m1": "https://images.unsplash.com/photo-1564564321837-a57b7070ac4f?w=700",
+    "slice_f1": "https://images.unsplash.com/photo-1573496359142-b8d87734a5a2?w=700",
+    "slice_m2": "https://images.unsplash.com/photo-1463453091185-61582044d556?w=700",
 }
 
 
