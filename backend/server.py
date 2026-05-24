@@ -657,19 +657,22 @@ async def seed_data():
     for ch in SEED_CHARACTERS:
         existing = await db.characters.find_one({"name": ch["name"], "is_official": True}, {"_id": 0})
         if existing:
-            # Update with any new fields (category, scenarios, tags) without changing chat_count/favorite_count
+            # Update text fields, scenarios, tags — but NEVER overwrite the avatar once stored
+            # (preserves AI-generated avatars across restarts)
             update = {
                 "tagline": ch["tagline"],
                 "description": ch["description"],
                 "personality": ch["personality"],
                 "backstory": ch["backstory"],
                 "greeting": ch["greeting"],
-                "avatar": ch["avatar"],
                 "genre": ch["genre"],
                 "category": ch["category"],
                 "tags": ch["tags"],
                 "scenarios": ch.get("scenarios", []),
             }
+            # Only set avatar if existing is missing one (defensive)
+            if not existing.get("avatar"):
+                update["avatar"] = ch["avatar"]
             await db.characters.update_one({"id": existing["id"]}, {"$set": update})
             continue
         doc = Character(**ch, is_official=True).dict()
