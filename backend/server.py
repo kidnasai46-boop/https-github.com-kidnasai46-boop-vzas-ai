@@ -9,9 +9,11 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 import uuid
+import base64
 from datetime import datetime, timezone, timedelta
 
 from emergentintegrations.llm.chat import LlmChat, UserMessage
+from openai import AsyncOpenAI
 
 from seed_data import SEED_CHARACTERS
 
@@ -23,6 +25,8 @@ client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
 EMERGENT_LLM_KEY = os.environ.get('EMERGENT_LLM_KEY', '')
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
@@ -385,28 +389,32 @@ async def unfavorite_character(char_id: str, user: dict = Depends(get_current_us
 
 @api_router.post("/characters/generate-avatar")
 async def generate_avatar(req: AvatarGenRequest, user: dict = Depends(get_current_user)):
+    if not openai_client:
+        raise HTTPException(status_code=500, detail="Image generation not configured")
+    prompt_text = (
+        "Cinematic close-up character portrait, fictional persona, no celebrities, "
+        "vertical 1:1 framing, dramatic moody lighting, ultra-detailed, digital art style. "
+        f"Character description: {req.prompt}"
+    )
     try:
-        chat = LlmChat(
-            api_key=EMERGENT_LLM_KEY,
-            session_id=f"avatar_{uuid.uuid4().hex}",
-            system_message="You generate cinematic, fictional character portrait avatars.",
+        response = await openai_client.images.generate(
+            model="dall-e-3",
+            prompt=prompt_text,
+            size="1024x1024",
+            quality="standard",
+            style="vivid",
+            n=1,
         )
-        chat.with_model("gemini", "gemini-3.1-flash-image-preview").with_params(modalities=["image", "text"])
-        prompt_text = (
-            "Cinematic close-up character portrait, fictional persona, no celebrities, "
-            "vertical 1:1 framing, dramatic moody lighting, ultra-detailed. "
-            f"Character description: {req.prompt}"
-        )
-        msg = UserMessage(text=prompt_text)
-        _text, images = await chat.send_message_multimodal_response(msg)
-        if not images:
-            raise HTTPException(status_code=500, detail="No image generated")
-        img = images[0]
-        mime = img.get("mime_type", "image/png")
-        return {"avatar": f"data:{mime};base64,{img['data']}"}
-    except HTTPException:
-        raise
+        image_url = response.data[0].url
+        async with httpx.AsyncClient(timeout=60) as http:
+            img_resp = await http.get(image_url)
+            img_resp.raise_for_status()
+        b64 = base64.b64encode(img_resp.content).decode("utf-8")
+        return {"avatar": f"data:image/png;base64,{b64}"}
     except Exception as e:
+        if "content_policy" in str(e).lower() or "safety" in str(e).lower():
+            logger.warning(f"OpenAI content policy rejection: {e}")
+            raise HTTPException(status_code=400, detail="Could not generate this image. Try adjusting the description.")
         logger.exception("Avatar generation failed")
         raise HTTPException(status_code=500, detail=f"Avatar generation failed: {str(e)}")
 
