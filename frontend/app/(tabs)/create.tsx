@@ -10,7 +10,7 @@ import { Colors, Radius, Spacing } from '@/src/theme/colors';
 import { Button } from '@/src/components/Button';
 import { api } from '@/src/api/client';
 
-const GENRES = ['Fantasy', 'Sci-Fi', 'Romance', 'Mystery', 'Drama', 'Adventure'];
+const GENRES = ['Fantasy', 'Sci-Fi', 'Romance', 'Horror', 'Comedy', 'Anime', 'Slice of Life', 'Historical', 'Mystery', 'Drama', 'Adventure'];
 
 interface FormState {
   name: string;
