@@ -9,11 +9,18 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 import uuid
+import base64
 from datetime import datetime, timezone, timedelta
 
 from emergentintegrations.llm.chat import LlmChat, UserMessage
+from openai import AsyncOpenAI
 
 from seed_data import SEED_CHARACTERS
+from story_engine import (
+    generate_story_arc, init_story_state, evaluate_meters_and_choices,
+    apply_meter_changes, check_chapter_advance, evaluate_ending,
+    build_story_prompt_block,
+)
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -23,6 +30,8 @@ client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
 EMERGENT_LLM_KEY = os.environ.get('EMERGENT_LLM_KEY', '')
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
@@ -385,6 +394,37 @@ async def unfavorite_character(char_id: str, user: dict = Depends(get_current_us
 
 @api_router.post("/characters/generate-avatar")
 async def generate_avatar(req: AvatarGenRequest, user: dict = Depends(get_current_user)):
+    """Generate an avatar. Uses DALL-E 3 if OPENAI_API_KEY is set,
+    otherwise falls back to Gemini Nano Banana via the Emergent Universal LLM Key."""
+    if openai_client:
+        prompt_text = (
+            "Cinematic close-up character portrait, fictional persona, no celebrities, "
+            "vertical 1:1 framing, dramatic moody lighting, ultra-detailed, digital art style. "
+            f"Character description: {req.prompt}"
+        )
+        try:
+            response = await openai_client.images.generate(
+                model="dall-e-3",
+                prompt=prompt_text,
+                size="1024x1024",
+                quality="standard",
+                style="vivid",
+                n=1,
+            )
+            image_url = response.data[0].url
+            async with httpx.AsyncClient(timeout=60) as http:
+                img_resp = await http.get(image_url)
+                img_resp.raise_for_status()
+            b64 = base64.b64encode(img_resp.content).decode("utf-8")
+            return {"avatar": f"data:image/png;base64,{b64}"}
+        except Exception as e:
+            if "content_policy" in str(e).lower() or "safety" in str(e).lower():
+                logger.warning(f"OpenAI content policy rejection: {e}")
+                raise HTTPException(status_code=400, detail="Could not generate this image. Try adjusting the description.")
+            logger.exception("Avatar generation failed")
+            raise HTTPException(status_code=500, detail=f"Avatar generation failed: {str(e)}")
+
+    # Gemini Nano Banana fallback (free via Emergent Universal LLM Key)
     try:
         chat = LlmChat(
             api_key=EMERGENT_LLM_KEY,
@@ -397,8 +437,7 @@ async def generate_avatar(req: AvatarGenRequest, user: dict = Depends(get_curren
             "vertical 1:1 framing, dramatic moody lighting, ultra-detailed. "
             f"Character description: {req.prompt}"
         )
-        msg = UserMessage(text=prompt_text)
-        _text, images = await chat.send_message_multimodal_response(msg)
+        _text, images = await chat.send_message_multimodal_response(UserMessage(text=prompt_text))
         if not images:
             raise HTTPException(status_code=500, detail="No image generated")
         img = images[0]
@@ -407,12 +446,12 @@ async def generate_avatar(req: AvatarGenRequest, user: dict = Depends(get_curren
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("Avatar generation failed")
+        logger.exception("Avatar generation (Gemini fallback) failed")
         raise HTTPException(status_code=500, detail=f"Avatar generation failed: {str(e)}")
 
 
 # ---------- Chats ----------
-def build_system_prompt(char: dict, user: dict, scenario: Optional[dict]) -> str:
+def build_system_prompt(char: dict, user: dict, scenario: Optional[dict], story_block: str = "") -> str:
     persona = user.get("persona") or {}
     persona_lines = []
     if persona.get("name"):
@@ -438,7 +477,7 @@ def build_system_prompt(char: dict, user: dict, scenario: Optional[dict]) -> str
             f"{scenario.get('description', '')}\n"
         )
 
-    return (
+    base = (
         f"You are roleplaying as {char['name']}.\n"
         f"Tagline: {char.get('tagline', '')}\n"
         f"Personality: {char.get('personality', '')}\n"
@@ -450,12 +489,15 @@ def build_system_prompt(char: dict, user: dict, scenario: Optional[dict]) -> str
         "Use *italic asterisks* for actions/expressions sparingly. "
         "Never break character or mention you are an AI. Adapt to the user's narrative direction. Keep content SFW."
     )
+    if story_block:
+        base += "\n" + story_block
+    return base
 
 
 async def _generate_assistant_reply(chat_id: str, char: dict, user: dict, scenario: Optional[dict],
-                                    history: List[dict]) -> str:
+                                    history: List[dict], story_block: str = "") -> str:
     """Replay history through Claude and get a fresh reply. Last message is treated as the new user prompt."""
-    system_message = build_system_prompt(char, user, scenario)
+    system_message = build_system_prompt(char, user, scenario, story_block=story_block)
     try:
         llm = LlmChat(
             api_key=EMERGENT_LLM_KEY,
@@ -528,6 +570,22 @@ async def start_chat(character_id: str, req: Optional[StartChatRequest] = None,
     greeting_msg = Message(chat_id=new_chat.id, role="assistant", content=greeting).dict()
     await db.messages.insert_one(dict(greeting_msg))
     await db.characters.update_one({"id": character_id}, {"$inc": {"chat_count": 1}})
+
+    try:
+        arc = await generate_story_arc(EMERGENT_LLM_KEY, char)
+        arc["chat_id"] = new_chat.id
+        await db.story_arcs.insert_one(dict(arc))
+        story_state = init_story_state(arc)
+        await db.chats.update_one(
+            {"id": new_chat.id},
+            {"$set": {"story_state": story_state}},
+        )
+        chat_dict = new_chat.dict()
+        chat_dict["story_state"] = story_state
+        return {"chat": chat_dict}
+    except Exception:
+        logger.exception("Story arc generation failed, continuing without story")
+
     return {"chat": new_chat.dict()}
 
 
@@ -562,17 +620,101 @@ async def send_message(chat_id: str, req: SendMessageRequest, user: dict = Depen
                 scenario = sc
                 break
 
-    reply_text = await _generate_assistant_reply(chat_id, char, user, scenario, history)
+    story_block = ""
+    if chat.get("story_state") and not chat["story_state"].get("completed"):
+        arc = await db.story_arcs.find_one({"id": chat["story_state"]["arc_id"]}, {"_id": 0})
+        if arc:
+            story_block = build_story_prompt_block(arc, chat["story_state"])
+
+    reply_text = await _generate_assistant_reply(chat_id, char, user, scenario, history, story_block=story_block)
 
     assistant_msg = Message(chat_id=chat_id, role="assistant", content=reply_text).dict()
     await db.messages.insert_one(dict(assistant_msg))
+
+    story_response = None
+    if chat.get("story_state") and not chat["story_state"].get("completed"):
+        ss = dict(chat["story_state"])
+        ss["messages_in_chapter"] = ss.get("messages_in_chapter", 0) + 1
+
+        eval_result = await evaluate_meters_and_choices(
+            EMERGENT_LLM_KEY, req.content, reply_text, ss["meters"]
+        )
+        ss["meters"] = apply_meter_changes(ss["meters"], eval_result.get("meter_changes", {}))
+
+        if eval_result.get("choice"):
+            choice = eval_result["choice"]
+            choice["chapter"] = ss["chapter"]
+            choice["message_index"] = ss["messages_in_chapter"]
+            ss["choices_made"].append(choice)
+
+        story_response = {
+            "chapter": ss["chapter"],
+            "meters": ss["meters"],
+            "chapter_transition": None,
+        }
+
+        arc = await db.story_arcs.find_one({"id": ss["arc_id"]}, {"_id": 0})
+        if arc:
+            if ss["chapter"] >= ss["total_chapters"]:
+                chapter_info = None
+                for ch in arc["chapters"]:
+                    if ch["number"] == ss["chapter"]:
+                        chapter_info = ch
+                        break
+                target = chapter_info.get("target_messages", 15) if chapter_info else 15
+                if ss["messages_in_chapter"] >= target:
+                    ending = await evaluate_ending(EMERGENT_LLM_KEY, arc, ss)
+                    ss["ending"] = ending.get("ending_type", "bad")
+                    ss["completed"] = True
+                    transition_msg = Message(
+                        chat_id=chat_id, role="system",
+                        content=f"Story Complete: {ending.get('ending_summary', '')}",
+                    ).dict()
+                    transition_msg["type"] = "chapter_transition"
+                    transition_msg["chapter_summary"] = ending.get("ending_summary", "")
+                    transition_msg["meters_snapshot"] = dict(ss["meters"])
+                    await db.messages.insert_one(dict(transition_msg))
+                    story_response["chapter_transition"] = {
+                        "title": f"Story Complete — {ss['ending'].title()} Ending",
+                        "summary": ending.get("ending_summary", ""),
+                    }
+                    story_response["ending"] = ss["ending"]
+                    story_response["completed"] = True
+            else:
+                advance = await check_chapter_advance(EMERGENT_LLM_KEY, arc, ss)
+                if advance:
+                    ss["chapter"] += 1
+                    ss["messages_in_chapter"] = 0
+                    next_ch = None
+                    for ch in arc["chapters"]:
+                        if ch["number"] == ss["chapter"]:
+                            next_ch = ch
+                            break
+                    transition_msg = Message(
+                        chat_id=chat_id, role="system",
+                        content=f"Chapter {ss['chapter']}: {next_ch['title'] if next_ch else ''}",
+                    ).dict()
+                    transition_msg["type"] = "chapter_transition"
+                    transition_msg["chapter_summary"] = advance.get("chapter_summary", "")
+                    transition_msg["meters_snapshot"] = dict(ss["meters"])
+                    await db.messages.insert_one(dict(transition_msg))
+                    story_response["chapter_transition"] = {
+                        "title": f"Chapter {ss['chapter']}: {next_ch['title'] if next_ch else ''}",
+                        "summary": advance.get("chapter_summary", ""),
+                        "previous_chapter": advance.get("chapter_summary", ""),
+                    }
+
+        await db.chats.update_one({"id": chat_id}, {"$set": {"story_state": ss}})
 
     await db.chats.update_one(
         {"id": chat_id},
         {"$set": {"last_message": reply_text[:200], "last_message_at": datetime.now(timezone.utc)}},
     )
 
-    return {"user_message": user_msg, "assistant_message": assistant_msg}
+    response = {"user_message": user_msg, "assistant_message": assistant_msg}
+    if story_response:
+        response["story_state"] = story_response
+    return response
 
 
 @api_router.post("/chats/{chat_id}/regenerate")
@@ -637,6 +779,18 @@ async def delete_chat(chat_id: str, user: dict = Depends(get_current_user)):
     return {"success": True}
 
 
+@api_router.get("/chats/{chat_id}/story")
+async def get_story(chat_id: str, user: dict = Depends(get_current_user)):
+    chat = await db.chats.find_one({"id": chat_id, "user_id": user["user_id"]}, {"_id": 0})
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    story_state = chat.get("story_state")
+    if not story_state:
+        return {"story_state": None, "arc": None}
+    arc = await db.story_arcs.find_one({"id": story_state["arc_id"]}, {"_id": 0})
+    return {"story_state": story_state, "arc": arc}
+
+
 @api_router.get("/")
 async def root():
     return {"message": "VZAS.AI API"}
@@ -695,6 +849,9 @@ async def on_startup():
         await db.messages.create_index([("chat_id", 1), ("created_at", 1)])
         await db.favorites.create_index([("user_id", 1), ("character_id", 1)], unique=True)
         await db.favorites.create_index("character_id")
+        await db.story_arcs.create_index("id", unique=True)
+        await db.story_arcs.create_index("chat_id")
+        await db.story_arcs.create_index("character_id")
     except Exception as e:
         logger.warning(f"Index creation: {e}")
     await seed_data()
