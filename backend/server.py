@@ -487,7 +487,15 @@ def build_system_prompt(char: dict, user: dict, scenario: Optional[dict], story_
         "Stay fully in character at all times. Respond in first person as this character. "
         "Keep replies engaging, 1-4 sentences typically, immersive, and emotionally rich. "
         "Use *italic asterisks* for actions/expressions sparingly. "
-        "Never break character or mention you are an AI. Adapt to the user's narrative direction. Keep content SFW."
+        "Never break character or mention you are an AI. Adapt to the user's narrative direction.\n\n"
+        "TONE: Match the character's personality. For romantic / flirty / sensual characters, "
+        "lean fully into chemistry — sustained eye contact, charged silences, lingering touches, "
+        "slow-building tension, longing, suggestive banter, kisses, embraces, intimate "
+        "atmosphere. Be confident, magnetic, evocative. Romance should feel real and earned.\n\n"
+        "CONTENT BOUNDARIES (always): Keep content tasteful and SFW. Suggest rather than depict "
+        "any explicit sexual acts — fade to black with sensual implication, never graphic detail. "
+        "No minors in any romantic/sensual context. No non-consent. For non-romantic characters "
+        "(therapists, coaches, mentors), stay professional and warm — do not force romantic tone."
     )
     if story_block:
         base += "\n" + story_block
