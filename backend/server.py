@@ -394,33 +394,59 @@ async def unfavorite_character(char_id: str, user: dict = Depends(get_current_us
 
 @api_router.post("/characters/generate-avatar")
 async def generate_avatar(req: AvatarGenRequest, user: dict = Depends(get_current_user)):
-    if not openai_client:
-        raise HTTPException(status_code=500, detail="Image generation not configured")
-    prompt_text = (
-        "Cinematic close-up character portrait, fictional persona, no celebrities, "
-        "vertical 1:1 framing, dramatic moody lighting, ultra-detailed, digital art style. "
-        f"Character description: {req.prompt}"
-    )
-    try:
-        response = await openai_client.images.generate(
-            model="dall-e-3",
-            prompt=prompt_text,
-            size="1024x1024",
-            quality="standard",
-            style="vivid",
-            n=1,
+    """Generate an avatar. Uses DALL-E 3 if OPENAI_API_KEY is set,
+    otherwise falls back to Gemini Nano Banana via the Emergent Universal LLM Key."""
+    if openai_client:
+        prompt_text = (
+            "Cinematic close-up character portrait, fictional persona, no celebrities, "
+            "vertical 1:1 framing, dramatic moody lighting, ultra-detailed, digital art style. "
+            f"Character description: {req.prompt}"
         )
-        image_url = response.data[0].url
-        async with httpx.AsyncClient(timeout=60) as http:
-            img_resp = await http.get(image_url)
-            img_resp.raise_for_status()
-        b64 = base64.b64encode(img_resp.content).decode("utf-8")
-        return {"avatar": f"data:image/png;base64,{b64}"}
+        try:
+            response = await openai_client.images.generate(
+                model="dall-e-3",
+                prompt=prompt_text,
+                size="1024x1024",
+                quality="standard",
+                style="vivid",
+                n=1,
+            )
+            image_url = response.data[0].url
+            async with httpx.AsyncClient(timeout=60) as http:
+                img_resp = await http.get(image_url)
+                img_resp.raise_for_status()
+            b64 = base64.b64encode(img_resp.content).decode("utf-8")
+            return {"avatar": f"data:image/png;base64,{b64}"}
+        except Exception as e:
+            if "content_policy" in str(e).lower() or "safety" in str(e).lower():
+                logger.warning(f"OpenAI content policy rejection: {e}")
+                raise HTTPException(status_code=400, detail="Could not generate this image. Try adjusting the description.")
+            logger.exception("Avatar generation failed")
+            raise HTTPException(status_code=500, detail=f"Avatar generation failed: {str(e)}")
+
+    # Gemini Nano Banana fallback (free via Emergent Universal LLM Key)
+    try:
+        chat = LlmChat(
+            api_key=EMERGENT_LLM_KEY,
+            session_id=f"avatar_{uuid.uuid4().hex}",
+            system_message="You generate cinematic, fictional character portrait avatars.",
+        )
+        chat.with_model("gemini", "gemini-3.1-flash-image-preview").with_params(modalities=["image", "text"])
+        prompt_text = (
+            "Cinematic close-up character portrait, fictional persona, no celebrities, "
+            "vertical 1:1 framing, dramatic moody lighting, ultra-detailed. "
+            f"Character description: {req.prompt}"
+        )
+        _text, images = await chat.send_message_multimodal_response(UserMessage(text=prompt_text))
+        if not images:
+            raise HTTPException(status_code=500, detail="No image generated")
+        img = images[0]
+        mime = img.get("mime_type", "image/png")
+        return {"avatar": f"data:{mime};base64,{img['data']}"}
+    except HTTPException:
+        raise
     except Exception as e:
-        if "content_policy" in str(e).lower() or "safety" in str(e).lower():
-            logger.warning(f"OpenAI content policy rejection: {e}")
-            raise HTTPException(status_code=400, detail="Could not generate this image. Try adjusting the description.")
-        logger.exception("Avatar generation failed")
+        logger.exception("Avatar generation (Gemini fallback) failed")
         raise HTTPException(status_code=500, detail=f"Avatar generation failed: {str(e)}")
 
 
@@ -461,7 +487,15 @@ def build_system_prompt(char: dict, user: dict, scenario: Optional[dict], story_
         "Stay fully in character at all times. Respond in first person as this character. "
         "Keep replies engaging, 1-4 sentences typically, immersive, and emotionally rich. "
         "Use *italic asterisks* for actions/expressions sparingly. "
-        "Never break character or mention you are an AI. Adapt to the user's narrative direction. Keep content SFW."
+        "Never break character or mention you are an AI. Adapt to the user's narrative direction.\n\n"
+        "TONE: Match the character's personality. For romantic / flirty / sensual characters, "
+        "lean fully into chemistry — sustained eye contact, charged silences, lingering touches, "
+        "slow-building tension, longing, suggestive banter, kisses, embraces, intimate "
+        "atmosphere. Be confident, magnetic, evocative. Romance should feel real and earned.\n\n"
+        "CONTENT BOUNDARIES (always): Keep content tasteful and SFW. Suggest rather than depict "
+        "any explicit sexual acts — fade to black with sensual implication, never graphic detail. "
+        "No minors in any romantic/sensual context. No non-consent. For non-romantic characters "
+        "(therapists, coaches, mentors), stay professional and warm — do not force romantic tone."
     )
     if story_block:
         base += "\n" + story_block
