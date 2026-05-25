@@ -1,25 +1,53 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   View, Text, StyleSheet, FlatList, TextInput, Pressable, Image,
-  KeyboardAvoidingView, Platform, ActivityIndicator, Alert,
+  KeyboardAvoidingView, Platform, ActivityIndicator, Alert, Modal,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
+import { LinearGradient } from 'expo-linear-gradient';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import * as Haptics from 'expo-haptics';
 
 import { Colors, Radius, Spacing } from '@/src/theme/colors';
 import { api } from '@/src/api/client';
+import { StoryHeader, StoryStateBrief, Meters } from '@/src/components/StoryHeader';
+import { ChapterTransitionCard } from '@/src/components/ChapterTransitionCard';
 
 interface Msg {
   id: string;
-  role: 'user' | 'assistant';
+  role: 'user' | 'assistant' | 'system';
   content: string;
   created_at?: string;
-  _streaming?: boolean; // local-only flag for word-reveal
+  type?: string; // 'chapter_transition' for system messages
+  chapter_summary?: string;
+  meters_snapshot?: Partial<Meters>;
+  _streaming?: boolean;
 }
 interface Character { id: string; name: string; avatar: string; tagline: string; }
-interface Chat { id: string; scenario_title?: string | null; }
+interface Chat {
+  id: string;
+  scenario_title?: string | null;
+  story_state?: StoryStateBrief;
+}
+
+interface SendMessageResponseStoryState {
+  chapter: number;
+  meters: Meters;
+  chapter_transition?: {
+    title: string;
+    summary: string;
+    previous_chapter?: string;
+  } | null;
+  ending?: string;
+  completed?: boolean;
+}
+
+const ENDING_VARIANT: Record<string, 'ending-good' | 'ending-bad' | 'ending-secret'> = {
+  good: 'ending-good',
+  bad: 'ending-bad',
+  secret: 'ending-secret',
+};
 
 export default function ChatScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
@@ -31,6 +59,10 @@ export default function ChatScreen() {
   const [draft, setDraft] = useState('');
   const [sending, setSending] = useState(false);
   const [regenIdx, setRegenIdx] = useState<number | null>(null);
+  const [storyState, setStoryState] = useState<StoryStateBrief | null>(null);
+  const [meterDeltas, setMeterDeltas] = useState<Partial<Meters> | null>(null);
+  const [latestChapterTitle, setLatestChapterTitle] = useState<string | undefined>(undefined);
+  const [showEnding, setShowEnding] = useState(false);
   const listRef = useRef<FlatList<Msg>>(null);
 
   const load = useCallback(async () => {
@@ -40,6 +72,16 @@ export default function ChatScreen() {
       setCharacter(data.character);
       setChat(data.chat);
       setMessages(data.messages);
+      if (data.chat?.story_state) {
+        setStoryState(data.chat.story_state);
+      }
+      // Derive latest chapter title from messages
+      const lastTransition = [...data.messages].reverse().find((m) => m.type === 'chapter_transition');
+      if (lastTransition?.content) {
+        // content is like "Chapter 2: The Library Whispers" or "Story Complete: ..."
+        const m = lastTransition.content.match(/^Chapter \d+:\s*(.+)$/);
+        if (m) setLatestChapterTitle(m[1]);
+      }
     } catch (e) {
       console.warn(e);
     } finally {
@@ -49,13 +91,12 @@ export default function ChatScreen() {
 
   useEffect(() => { load(); }, [load]);
 
-  // Reveal a final assistant message word-by-word for streaming feel
   const revealStream = (finalText: string, replaceId: string) => {
     setMessages((m) => m.map((mm) => mm.id === replaceId ? { ...mm, content: '', _streaming: true } : mm));
-    const words = finalText.split(/(\s+)/); // keep whitespace tokens
+    const words = finalText.split(/(\s+)/);
     let i = 0;
     const tick = () => {
-      i = Math.min(i + 2, words.length); // 2 tokens per tick = fast but visible
+      i = Math.min(i + 2, words.length);
       const partial = words.slice(0, i).join('');
       setMessages((m) => m.map((mm) => mm.id === replaceId ? { ...mm, content: partial } : mm));
       if (i < words.length) {
@@ -65,6 +106,60 @@ export default function ChatScreen() {
       }
     };
     tick();
+  };
+
+  const applyStoryStateUpdate = (newState: SendMessageResponseStoryState) => {
+    if (!storyState) {
+      // Existing chat had no story_state — backend created one mid-flight; just adopt the new
+      setStoryState({
+        chapter: newState.chapter,
+        total_chapters: newState.chapter, // unknown total; safe default
+        meters: newState.meters,
+        completed: newState.completed,
+        ending: newState.ending,
+      });
+      return;
+    }
+    // Compute deltas vs current
+    const deltas: Partial<Meters> = {};
+    (['trust', 'affection', 'rivalry', 'fear'] as const).forEach((k) => {
+      const before = storyState.meters[k];
+      const after = newState.meters[k];
+      const d = after - before;
+      if (d !== 0) deltas[k] = d;
+    });
+    setMeterDeltas(Object.keys(deltas).length ? deltas : null);
+    setTimeout(() => setMeterDeltas(null), 3500);
+
+    setStoryState({
+      ...storyState,
+      chapter: newState.chapter,
+      meters: newState.meters,
+      completed: newState.completed ?? storyState.completed,
+      ending: newState.ending ?? storyState.ending,
+    });
+
+    if (newState.chapter_transition) {
+      // Backend has already inserted the system message — we'll get it on next get_chat,
+      // but for instant UX we synthesize and append it locally too.
+      const synthetic: Msg = {
+        id: `transition_${Date.now()}`,
+        role: 'system',
+        content: newState.chapter_transition.title,
+        type: 'chapter_transition',
+        chapter_summary: newState.chapter_transition.summary,
+        meters_snapshot: newState.meters,
+      };
+      setMessages((m) => [...m, synthetic]);
+      const m = newState.chapter_transition.title.match(/^Chapter \d+:\s*(.+)$/);
+      if (m) setLatestChapterTitle(m[1]);
+      if (newState.completed) {
+        setShowEnding(true);
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+      } else {
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning).catch(() => {});
+      }
+    }
   };
 
   const send = async () => {
@@ -77,10 +172,12 @@ export default function ChatScreen() {
     setSending(true);
     setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 50);
     try {
-      const data = await api<{ user_message: Msg; assistant_message: Msg }>(
-        `/chats/${id}/messages`,
-        { method: 'POST', body: { content: text }, timeoutMs: 90000 },
-      );
+      const data = await api<{
+        user_message: Msg;
+        assistant_message: Msg;
+        story_state?: SendMessageResponseStoryState;
+      }>(`/chats/${id}/messages`, { method: 'POST', body: { content: text }, timeoutMs: 120000 });
+
       const placeholderId = data.assistant_message.id;
       setMessages((m) => [
         ...m.filter((mm) => mm.id !== optimistic.id),
@@ -89,6 +186,10 @@ export default function ChatScreen() {
       ]);
       setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 50);
       revealStream(data.assistant_message.content, placeholderId);
+
+      if (data.story_state) {
+        applyStoryStateUpdate(data.story_state);
+      }
     } catch (e) {
       setMessages((m) => m.filter((mm) => mm.id !== optimistic.id));
       setDraft(text);
@@ -100,7 +201,6 @@ export default function ChatScreen() {
 
   const regenerate = async () => {
     if (sending || regenIdx !== null) return;
-    // Find the last assistant message index
     let lastIdx = -1;
     for (let i = messages.length - 1; i >= 0; i--) {
       if (messages[i].role === 'assistant') { lastIdx = i; break; }
@@ -132,7 +232,6 @@ export default function ChatScreen() {
     );
   }
 
-  // Index of last assistant message (for showing regen button only on the latest)
   let lastAssistantIdx = -1;
   for (let i = messages.length - 1; i >= 0; i--) {
     if (messages[i].role === 'assistant' && !messages[i]._streaming) { lastAssistantIdx = i; break; }
@@ -161,6 +260,37 @@ export default function ChatScreen() {
         <View style={{ width: 40 }} />
       </View>
 
+      {storyState && !storyState.completed && (
+        <StoryHeader
+          state={storyState}
+          chapterTitle={latestChapterTitle}
+          deltas={meterDeltas}
+        />
+      )}
+      {storyState?.completed && storyState.ending && (
+        <Pressable style={styles.endingBar} onPress={() => setShowEnding(true)} testID="ending-replay-btn">
+          <LinearGradient
+            colors={
+              storyState.ending === 'good' ? ['rgba(16,185,129,0.4)', 'rgba(6,182,212,0.2)']
+              : storyState.ending === 'bad' ? ['rgba(239,68,68,0.4)', 'rgba(124,58,237,0.2)']
+              : ['rgba(245,158,11,0.4)', 'rgba(124,58,237,0.2)']
+            }
+            start={{ x: 0, y: 0 }}
+            end={{ x: 1, y: 0 }}
+            style={StyleSheet.absoluteFillObject}
+          />
+          <Ionicons
+            name={storyState.ending === 'good' ? 'sparkles' : storyState.ending === 'bad' ? 'flame' : 'eye'}
+            size={14}
+            color="#fff"
+          />
+          <Text style={styles.endingText}>
+            Story Complete · {storyState.ending.charAt(0).toUpperCase() + storyState.ending.slice(1)} Ending
+          </Text>
+          <Ionicons name="chevron-forward" size={16} color="rgba(255,255,255,0.7)" />
+        </Pressable>
+      )}
+
       <KeyboardAvoidingView
         style={{ flex: 1 }}
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
@@ -170,36 +300,54 @@ export default function ChatScreen() {
           data={messages}
           keyExtractor={(m) => m.id}
           contentContainerStyle={{ padding: Spacing.lg, paddingBottom: Spacing.md, gap: 10 }}
-          renderItem={({ item, index }) => (
-            <View>
-              <View
-                testID={`msg-${item.role}`}
-                style={[styles.bubble, item.role === 'user' ? styles.bubbleUser : styles.bubbleAssistant]}
-              >
-                <Text style={item.role === 'user' ? styles.userText : styles.assistantText}>
-                  {item.content}
-                  {item._streaming && <Text style={styles.cursor}>▌</Text>}
-                </Text>
-              </View>
-              {item.role === 'assistant' && index === lastAssistantIdx && index > 0 && (
-                <View style={styles.msgActions}>
-                  <Pressable
-                    testID="msg-regen-btn"
-                    onPress={regenerate}
-                    style={styles.msgAction}
-                    disabled={regenIdx !== null}
-                  >
-                    {regenIdx !== null ? (
-                      <ActivityIndicator size="small" color={Colors.textSecondary} />
-                    ) : (
-                      <Ionicons name="refresh" size={14} color={Colors.textSecondary} />
-                    )}
-                    <Text style={styles.msgActionText}>Regenerate</Text>
-                  </Pressable>
+          renderItem={({ item, index }) => {
+            if (item.role === 'system' && item.type === 'chapter_transition') {
+              const isEnding = item.content.toLowerCase().startsWith('story complete');
+              const endingType = isEnding && storyState?.ending ? storyState.ending : 'good';
+              return (
+                <ChapterTransitionCard
+                  title={item.content}
+                  summary={item.chapter_summary}
+                  meters={item.meters_snapshot}
+                  variant={isEnding ? ENDING_VARIANT[endingType] || 'ending-good' : 'chapter'}
+                />
+              );
+            }
+            if (item.role === 'system') {
+              // Generic system message fallback
+              return <Text style={styles.systemText}>{item.content}</Text>;
+            }
+            return (
+              <View>
+                <View
+                  testID={`msg-${item.role}`}
+                  style={[styles.bubble, item.role === 'user' ? styles.bubbleUser : styles.bubbleAssistant]}
+                >
+                  <Text style={item.role === 'user' ? styles.userText : styles.assistantText}>
+                    {item.content}
+                    {item._streaming && <Text style={styles.cursor}>▌</Text>}
+                  </Text>
                 </View>
-              )}
-            </View>
-          )}
+                {item.role === 'assistant' && index === lastAssistantIdx && index > 0 && (
+                  <View style={styles.msgActions}>
+                    <Pressable
+                      testID="msg-regen-btn"
+                      onPress={regenerate}
+                      style={styles.msgAction}
+                      disabled={regenIdx !== null}
+                    >
+                      {regenIdx !== null ? (
+                        <ActivityIndicator size="small" color={Colors.textSecondary} />
+                      ) : (
+                        <Ionicons name="refresh" size={14} color={Colors.textSecondary} />
+                      )}
+                      <Text style={styles.msgActionText}>Regenerate</Text>
+                    </Pressable>
+                  </View>
+                )}
+              </View>
+            );
+          }}
           onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: false })}
           ListFooterComponent={
             sending ? (
@@ -216,22 +364,107 @@ export default function ChatScreen() {
             testID="chat-input"
             value={draft}
             onChangeText={setDraft}
-            placeholder={`Message ${character?.name?.split(' ')[0] || ''}…`}
+            placeholder={
+              storyState?.completed
+                ? 'The story has ended.'
+                : `Message ${character?.name?.split(' ')[0] || ''}…`
+            }
             placeholderTextColor={Colors.textSecondary}
             style={styles.input}
             multiline
             maxLength={2000}
+            editable={!storyState?.completed}
           />
           <Pressable
             testID="chat-send-btn"
             onPress={send}
-            disabled={!draft.trim() || sending}
-            style={[styles.sendBtn, (!draft.trim() || sending) && { opacity: 0.5 }]}
+            disabled={!draft.trim() || sending || !!storyState?.completed}
+            style={[styles.sendBtn, (!draft.trim() || sending || !!storyState?.completed) && { opacity: 0.5 }]}
           >
             <Ionicons name="send" size={18} color="#fff" />
           </Pressable>
         </View>
       </KeyboardAvoidingView>
+
+      {/* Story-complete ending overlay */}
+      <Modal
+        visible={showEnding}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setShowEnding(false)}
+      >
+        <Pressable style={styles.endingBackdrop} onPress={() => setShowEnding(false)}>
+          <Pressable style={styles.endingSheet} onPress={(e) => e.stopPropagation()}>
+            <LinearGradient
+              colors={
+                storyState?.ending === 'good' ? ['rgba(16,185,129,0.35)', 'rgba(13,13,26,1)']
+                : storyState?.ending === 'bad' ? ['rgba(239,68,68,0.35)', 'rgba(13,13,26,1)']
+                : ['rgba(245,158,11,0.35)', 'rgba(13,13,26,1)']
+              }
+              start={{ x: 0.5, y: 0 }}
+              end={{ x: 0.5, y: 1 }}
+              style={StyleSheet.absoluteFillObject}
+            />
+            <View style={styles.endingHeader}>
+              <Ionicons
+                name={storyState?.ending === 'good' ? 'sparkles'
+                  : storyState?.ending === 'bad' ? 'flame'
+                  : 'eye'}
+                size={42}
+                color={
+                  storyState?.ending === 'good' ? Colors.success
+                  : storyState?.ending === 'bad' ? Colors.error
+                  : Colors.warning
+                }
+              />
+              <Text style={styles.endingTitle}>Story Complete</Text>
+              <Text style={styles.endingSub}>
+                {storyState?.ending === 'good' ? 'A heartfelt ending earned through trust and kindness.'
+                  : storyState?.ending === 'bad' ? 'A bitter ending shaped by your choices.'
+                  : "A path most never find — you uncovered the secret ending."}
+              </Text>
+              <View style={[styles.endingBadge, {
+                backgroundColor:
+                  storyState?.ending === 'good' ? Colors.success
+                  : storyState?.ending === 'bad' ? Colors.error
+                  : Colors.warning,
+              }]}>
+                <Text style={styles.endingBadgeText}>
+                  {(storyState?.ending || 'good').toUpperCase()} ENDING
+                </Text>
+              </View>
+            </View>
+
+            {storyState && (
+              <View style={styles.endingMeters}>
+                {(['trust', 'affection', 'rivalry', 'fear'] as const).map((k) => (
+                  <View key={k} style={styles.endingMeterChip}>
+                    <Text style={styles.endingMeterLabel}>{k}</Text>
+                    <Text style={styles.endingMeterValue}>{storyState.meters[k]}</Text>
+                  </View>
+                ))}
+              </View>
+            )}
+
+            <View style={styles.endingActions}>
+              <Pressable
+                testID="ending-back-btn"
+                style={styles.endingBtn}
+                onPress={() => { setShowEnding(false); router.back(); }}
+              >
+                <Text style={styles.endingBtnText}>Back to Chats</Text>
+              </Pressable>
+              <Pressable
+                testID="ending-close-btn"
+                style={[styles.endingBtn, styles.endingBtnPrimary]}
+                onPress={() => setShowEnding(false)}
+              >
+                <Text style={[styles.endingBtnText, { color: '#fff' }]}>View Conversation</Text>
+              </Pressable>
+            </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -249,6 +482,17 @@ const styles = StyleSheet.create({
   charAvatar: { width: 38, height: 38, borderRadius: 19 },
   charName: { color: '#fff', fontSize: 15, fontWeight: '700' },
   charStatus: { color: Colors.success, fontSize: 11, marginTop: 2 },
+  endingBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingHorizontal: Spacing.lg,
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: Colors.borderSubtle,
+    overflow: 'hidden',
+  },
+  endingText: { flex: 1, color: '#fff', fontSize: 13, fontWeight: '700' },
   bubble: { maxWidth: '85%', paddingHorizontal: 14, paddingVertical: 10 },
   bubbleUser: {
     alignSelf: 'flex-end',
@@ -266,6 +510,10 @@ const styles = StyleSheet.create({
   userText: { color: '#fff', fontSize: 15, lineHeight: 21 },
   assistantText: { color: Colors.textPrimary, fontSize: 15, lineHeight: 21 },
   cursor: { color: Colors.brandPrimary, fontWeight: '700' },
+  systemText: {
+    color: Colors.textSecondary, fontSize: 12, fontStyle: 'italic',
+    textAlign: 'center', paddingVertical: 4,
+  },
   msgActions: { flexDirection: 'row', marginTop: 4, marginLeft: 4, gap: 8 },
   msgAction: {
     flexDirection: 'row', alignItems: 'center', gap: 5,
@@ -292,4 +540,45 @@ const styles = StyleSheet.create({
     backgroundColor: Colors.brandPrimary,
     alignItems: 'center', justifyContent: 'center',
   },
+  endingBackdrop: {
+    flex: 1, backgroundColor: 'rgba(0,0,0,0.7)',
+    alignItems: 'center', justifyContent: 'center',
+    padding: Spacing.lg,
+  },
+  endingSheet: {
+    width: '100%', maxWidth: 420,
+    backgroundColor: Colors.bgSecondary,
+    borderRadius: Radius.lg, padding: Spacing.xl,
+    overflow: 'hidden',
+    borderWidth: 1, borderColor: Colors.borderDefault,
+  },
+  endingHeader: { alignItems: 'center', gap: 8, marginBottom: Spacing.lg },
+  endingTitle: { color: '#fff', fontSize: 26, fontWeight: '800', letterSpacing: -0.5 },
+  endingSub: { color: Colors.textSecondary, fontSize: 13, textAlign: 'center', lineHeight: 19 },
+  endingBadge: {
+    paddingHorizontal: 12, paddingVertical: 5,
+    borderRadius: Radius.pill, marginTop: 4,
+  },
+  endingBadgeText: { color: '#fff', fontSize: 11, fontWeight: '800', letterSpacing: 1 },
+  endingMeters: {
+    flexDirection: 'row', flexWrap: 'wrap', gap: 8,
+    justifyContent: 'center', marginBottom: Spacing.lg,
+  },
+  endingMeterChip: {
+    paddingHorizontal: 10, paddingVertical: 6,
+    backgroundColor: 'rgba(255,255,255,0.06)', borderRadius: Radius.md,
+    borderWidth: 1, borderColor: Colors.borderSubtle, alignItems: 'center',
+    minWidth: 70,
+  },
+  endingMeterLabel: { color: Colors.textSecondary, fontSize: 10, fontWeight: '600', textTransform: 'uppercase' },
+  endingMeterValue: { color: '#fff', fontSize: 16, fontWeight: '800' },
+  endingActions: { flexDirection: 'row', gap: 8 },
+  endingBtn: {
+    flex: 1, paddingVertical: 12, borderRadius: Radius.pill,
+    alignItems: 'center', justifyContent: 'center',
+    backgroundColor: 'rgba(255,255,255,0.08)',
+    borderWidth: 1, borderColor: Colors.borderDefault,
+  },
+  endingBtnPrimary: { backgroundColor: Colors.brandPrimary, borderColor: Colors.brandPrimary },
+  endingBtnText: { color: Colors.textPrimary, fontSize: 14, fontWeight: '700' },
 });
