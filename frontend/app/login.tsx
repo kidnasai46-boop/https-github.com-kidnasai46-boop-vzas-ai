@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { View, Text, StyleSheet, Image, Alert, Pressable } from 'react-native';
+import { View, Text, StyleSheet, Image, Alert, Pressable, TextInput } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Ionicons } from '@expo/vector-icons';
@@ -12,6 +12,8 @@ import { useAuth } from '@/src/context/auth';
 export default function Login() {
   const { signIn, user } = useAuth();
   const [loading, setLoading] = useState(false);
+  const [email, setEmail] = useState('');
+  const [name, setName] = useState('');
   const router = useRouter();
 
   React.useEffect(() => {
@@ -19,9 +21,14 @@ export default function Login() {
   }, [user, router]);
 
   const onSignIn = async () => {
+    const trimmed = email.trim();
+    if (!trimmed || !trimmed.includes('@')) {
+      Alert.alert('Enter your email', 'Please enter a valid email address to continue.');
+      return;
+    }
     try {
       setLoading(true);
-      await signIn();
+      await signIn(trimmed, name.trim() || undefined);
     } catch (e: any) {
       Alert.alert('Sign-in failed', e?.message || 'Please try again.');
     } finally {
@@ -63,12 +70,32 @@ export default function Login() {
         </View>
 
         <View style={styles.footer}>
+          <TextInput
+            testID="login-email-input"
+            value={email}
+            onChangeText={setEmail}
+            placeholder="Email"
+            placeholderTextColor={Colors.textSecondary}
+            keyboardType="email-address"
+            autoCapitalize="none"
+            autoCorrect={false}
+            style={styles.input}
+          />
+          <TextInput
+            testID="login-name-input"
+            value={name}
+            onChangeText={setName}
+            placeholder="Display name (optional)"
+            placeholderTextColor={Colors.textSecondary}
+            autoCapitalize="words"
+            style={styles.input}
+          />
           <Button
-            testID="login-google-btn"
-            label="Continue with Google"
+            testID="login-continue-btn"
+            label="Continue"
             onPress={onSignIn}
             loading={loading}
-            icon={<Ionicons name="logo-google" size={18} color="#fff" />}
+            icon={<Ionicons name="arrow-forward" size={18} color="#fff" />}
           />
           <Text style={styles.disclaimer}>
             By continuing you agree to our Terms & Privacy Policy.
@@ -106,6 +133,16 @@ const styles = StyleSheet.create({
     borderWidth: 2, borderColor: 'rgba(255,255,255,0.08)',
   },
   footer: { paddingBottom: Spacing.lg, gap: Spacing.md },
+  input: {
+    backgroundColor: Colors.inputBg,
+    borderRadius: Radius.md,
+    borderWidth: 1,
+    borderColor: Colors.borderDefault,
+    color: '#fff',
+    fontSize: 15,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+  },
   disclaimer: {
     color: Colors.textSecondary, fontSize: 12, textAlign: 'center',
   },

@@ -42,7 +42,12 @@ export async function api<T = any>(path: string, opts: ApiOptions = {}): Promise
     });
     clearTimeout(timer);
     const text = await resp.text();
-    const data = text ? JSON.parse(text) : ({} as any);
+    let data: any;
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      throw new Error(text || `Request failed (${resp.status})`);
+    }
     if (!resp.ok) {
       const message = data?.detail || `Request failed (${resp.status})`;
       throw new Error(typeof message === 'string' ? message : JSON.stringify(message));

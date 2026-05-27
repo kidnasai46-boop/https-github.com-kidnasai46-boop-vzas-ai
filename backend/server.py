@@ -10,11 +10,12 @@ from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 import uuid
 import base64
+import secrets
 from datetime import datetime, timezone, timedelta
 
-from emergentintegrations.llm.chat import LlmChat, UserMessage
 from openai import AsyncOpenAI
 
+from llm_client import complete
 from seed_data import SEED_CHARACTERS
 from story_engine import (
     generate_story_arc, init_story_state, evaluate_meters_and_choices,
@@ -29,7 +30,6 @@ mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
-EMERGENT_LLM_KEY = os.environ.get('EMERGENT_LLM_KEY', '')
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
@@ -57,8 +57,9 @@ class User(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
-class SessionRequest(BaseModel):
-    session_id: str
+class LoginRequest(BaseModel):
+    email: str
+    name: Optional[str] = None
 
 
 class Scenario(BaseModel):
@@ -170,31 +171,28 @@ async def get_current_user_optional(authorization: Optional[str] = Header(None))
 
 
 # ---------- Auth Endpoints ----------
-@api_router.post("/auth/google")
-async def google_auth(req: SessionRequest):
-    async with httpx.AsyncClient(timeout=15) as http_client:
-        resp = await http_client.get(
-            "https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data",
-            headers={"X-Session-ID": req.session_id},
-        )
-        if resp.status_code != 200:
-            raise HTTPException(status_code=401, detail="Invalid Emergent session_id")
-        data = resp.json()
+@api_router.post("/auth/login")
+async def login(req: LoginRequest):
+    """Simple self-managed login. Find-or-create a user by email and issue a
+    backend session token (no external OAuth provider)."""
+    email = req.email.strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="A valid email is required")
+    display_name = (req.name or "").strip() or email.split("@")[0]
 
-    email = data["email"]
     existing = await db.users.find_one({"email": email}, {"_id": 0})
     if existing:
         user_id = existing["user_id"]
         await db.users.update_one(
             {"user_id": user_id},
-            {"$set": {"name": data.get("name"), "picture": data.get("picture")}},
+            {"$set": {"name": display_name}},
         )
     else:
         user_id = f"user_{uuid.uuid4().hex[:12]}"
-        new_user = User(user_id=user_id, email=email, name=data.get("name", email), picture=data.get("picture")).dict()
+        new_user = User(user_id=user_id, email=email, name=display_name).dict()
         await db.users.insert_one(dict(new_user))
 
-    session_token = data["session_token"]
+    session_token = secrets.token_urlsafe(32)
     expires_at = datetime.now(timezone.utc) + timedelta(days=7)
     await db.user_sessions.update_one(
         {"session_token": session_token},
@@ -394,59 +392,37 @@ async def unfavorite_character(char_id: str, user: dict = Depends(get_current_us
 
 @api_router.post("/characters/generate-avatar")
 async def generate_avatar(req: AvatarGenRequest, user: dict = Depends(get_current_user)):
-    """Generate an avatar. Uses DALL-E 3 if OPENAI_API_KEY is set,
-    otherwise falls back to Gemini Nano Banana via the Emergent Universal LLM Key."""
-    if openai_client:
-        prompt_text = (
-            "Cinematic close-up character portrait, fictional persona, no celebrities, "
-            "vertical 1:1 framing, dramatic moody lighting, ultra-detailed, digital art style. "
-            f"Character description: {req.prompt}"
-        )
-        try:
-            response = await openai_client.images.generate(
-                model="dall-e-3",
-                prompt=prompt_text,
-                size="1024x1024",
-                quality="standard",
-                style="vivid",
-                n=1,
-            )
-            image_url = response.data[0].url
-            async with httpx.AsyncClient(timeout=60) as http:
-                img_resp = await http.get(image_url)
-                img_resp.raise_for_status()
-            b64 = base64.b64encode(img_resp.content).decode("utf-8")
-            return {"avatar": f"data:image/png;base64,{b64}"}
-        except Exception as e:
-            if "content_policy" in str(e).lower() or "safety" in str(e).lower():
-                logger.warning(f"OpenAI content policy rejection: {e}")
-                raise HTTPException(status_code=400, detail="Could not generate this image. Try adjusting the description.")
-            logger.exception("Avatar generation failed")
-            raise HTTPException(status_code=500, detail=f"Avatar generation failed: {str(e)}")
+    """Generate an avatar with OpenAI DALL-E 3. Requires OPENAI_API_KEY."""
+    if not openai_client:
+        raise HTTPException(status_code=400, detail="Image generation not configured")
 
-    # Gemini Nano Banana fallback (free via Emergent Universal LLM Key)
+    prompt_text = (
+        "Cinematic close-up character portrait, fictional persona, no celebrities, "
+        "vertical 1:1 framing, dramatic moody lighting, ultra-detailed, digital art style. "
+        f"Character description: {req.prompt}"
+    )
     try:
-        chat = LlmChat(
-            api_key=EMERGENT_LLM_KEY,
-            session_id=f"avatar_{uuid.uuid4().hex}",
-            system_message="You generate cinematic, fictional character portrait avatars.",
+        response = await openai_client.images.generate(
+            model="dall-e-3",
+            prompt=prompt_text,
+            size="1024x1024",
+            quality="standard",
+            style="vivid",
+            n=1,
         )
-        chat.with_model("gemini", "gemini-3.1-flash-image-preview").with_params(modalities=["image", "text"])
-        prompt_text = (
-            "Cinematic close-up character portrait, fictional persona, no celebrities, "
-            "vertical 1:1 framing, dramatic moody lighting, ultra-detailed. "
-            f"Character description: {req.prompt}"
-        )
-        _text, images = await chat.send_message_multimodal_response(UserMessage(text=prompt_text))
-        if not images:
-            raise HTTPException(status_code=500, detail="No image generated")
-        img = images[0]
-        mime = img.get("mime_type", "image/png")
-        return {"avatar": f"data:{mime};base64,{img['data']}"}
+        image_url = response.data[0].url
+        async with httpx.AsyncClient(timeout=60) as http:
+            img_resp = await http.get(image_url)
+            img_resp.raise_for_status()
+        b64 = base64.b64encode(img_resp.content).decode("utf-8")
+        return {"avatar": f"data:image/png;base64,{b64}"}
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("Avatar generation (Gemini fallback) failed")
+        if "content_policy" in str(e).lower() or "safety" in str(e).lower():
+            logger.warning(f"OpenAI content policy rejection: {e}")
+            raise HTTPException(status_code=400, detail="Could not generate this image. Try adjusting the description.")
+        logger.exception("Avatar generation failed")
         raise HTTPException(status_code=500, detail=f"Avatar generation failed: {str(e)}")
 
 
@@ -504,24 +480,26 @@ def build_system_prompt(char: dict, user: dict, scenario: Optional[dict], story_
 
 async def _generate_assistant_reply(chat_id: str, char: dict, user: dict, scenario: Optional[dict],
                                     history: List[dict], story_block: str = "") -> str:
-    """Replay history through Claude and get a fresh reply. Last message is treated as the new user prompt."""
-    system_message = build_system_prompt(char, user, scenario, story_block=story_block)
-    try:
-        llm = LlmChat(
-            api_key=EMERGENT_LLM_KEY,
-            session_id=f"chat_{chat_id}_{uuid.uuid4().hex[:8]}",
-            system_message=system_message,
-        ).with_model("anthropic", "claude-sonnet-4-5-20250929")
+    """Build the conversation from history and get a fresh Claude reply.
 
-        prior = history[:-1]
-        for m in prior:
-            if m["role"] == "user":
-                try:
-                    await llm.send_message(UserMessage(text=m["content"]))
-                except Exception:
-                    pass
-        last_user = history[-1]
-        return await llm.send_message(UserMessage(text=last_user["content"]))
+    The history is mapped to Anthropic message format. System/transition
+    messages are skipped. The last entry is the new user prompt.
+    """
+    system_message = build_system_prompt(char, user, scenario, story_block=story_block)
+    messages = [
+        {"role": m["role"], "content": m["content"]}
+        for m in history
+        if m.get("role") in ("user", "assistant") and m.get("content")
+    ]
+    # Anthropic requires the conversation to start with a user turn; the
+    # character's greeting is an assistant message, so drop any leading
+    # assistant turns.
+    while messages and messages[0]["role"] == "assistant":
+        messages.pop(0)
+    if not messages:
+        messages = [{"role": "user", "content": history[-1]["content"]}]
+    try:
+        return await complete(system_message, messages, max_tokens=1024)
     except Exception:
         logger.exception("LLM call failed")
         return "*looks away thoughtfully* Sorry, my mind drifted for a moment. Could you say that again?"
@@ -580,7 +558,7 @@ async def start_chat(character_id: str, req: Optional[StartChatRequest] = None,
     await db.characters.update_one({"id": character_id}, {"$inc": {"chat_count": 1}})
 
     try:
-        arc = await generate_story_arc(EMERGENT_LLM_KEY, char)
+        arc = await generate_story_arc(char)
         arc["chat_id"] = new_chat.id
         await db.story_arcs.insert_one(dict(arc))
         story_state = init_story_state(arc)
@@ -645,7 +623,7 @@ async def send_message(chat_id: str, req: SendMessageRequest, user: dict = Depen
         ss["messages_in_chapter"] = ss.get("messages_in_chapter", 0) + 1
 
         eval_result = await evaluate_meters_and_choices(
-            EMERGENT_LLM_KEY, req.content, reply_text, ss["meters"]
+            req.content, reply_text, ss["meters"]
         )
         ss["meters"] = apply_meter_changes(ss["meters"], eval_result.get("meter_changes", {}))
 
@@ -671,7 +649,7 @@ async def send_message(chat_id: str, req: SendMessageRequest, user: dict = Depen
                         break
                 target = chapter_info.get("target_messages", 15) if chapter_info else 15
                 if ss["messages_in_chapter"] >= target:
-                    ending = await evaluate_ending(EMERGENT_LLM_KEY, arc, ss)
+                    ending = await evaluate_ending(arc, ss)
                     ss["ending"] = ending.get("ending_type", "bad")
                     ss["completed"] = True
                     transition_msg = Message(
@@ -689,7 +667,7 @@ async def send_message(chat_id: str, req: SendMessageRequest, user: dict = Depen
                     story_response["ending"] = ss["ending"]
                     story_response["completed"] = True
             else:
-                advance = await check_chapter_advance(EMERGENT_LLM_KEY, arc, ss)
+                advance = await check_chapter_advance(arc, ss)
                 if advance:
                     ss["chapter"] += 1
                     ss["messages_in_chapter"] = 0

@@ -63,6 +63,45 @@ class TestCharactersPublic:
 # ---------- Auth ----------
 
 class TestAuth:
+    def test_login_creates_user_and_issues_token(self, client, api, has_object_id):
+        import uuid as _uuid
+        email = f"login_{_uuid.uuid4().hex[:10]}@example.com"
+        r = client.post(f"{api}/auth/login",
+                        json={"email": email, "name": "Login Tester"}, timeout=15)
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data.get("session_token"), "Expected a session_token"
+        assert data["user"]["email"] == email
+        assert data["user"]["name"] == "Login Tester"
+        assert not has_object_id(data)
+        # the issued token should authenticate /auth/me
+        token = data["session_token"]
+        me = client.get(f"{api}/auth/me",
+                        headers={"Authorization": f"Bearer {token}"}, timeout=15)
+        assert me.status_code == 200
+        assert me.json()["user"]["email"] == email
+
+    def test_login_returning_user_keeps_identity(self, client, api):
+        import uuid as _uuid
+        email = f"return_{_uuid.uuid4().hex[:10]}@example.com"
+        first = client.post(f"{api}/auth/login",
+                            json={"email": email, "name": "First Name"}, timeout=15)
+        assert first.status_code == 200, first.text
+        user_id = first.json()["user"]["user_id"]
+        token1 = first.json()["session_token"]
+
+        second = client.post(f"{api}/auth/login",
+                             json={"email": email, "name": "Second Name"}, timeout=15)
+        assert second.status_code == 200, second.text
+        # same user, fresh token, updated display name
+        assert second.json()["user"]["user_id"] == user_id
+        assert second.json()["user"]["name"] == "Second Name"
+        assert second.json()["session_token"] != token1
+
+    def test_login_rejects_bad_email(self, client, api):
+        r = client.post(f"{api}/auth/login", json={"email": "not-an-email"}, timeout=15)
+        assert r.status_code == 400
+
     def test_auth_me_with_valid_token(self, client, api, auth_headers, has_object_id):
         r = client.get(f"{api}/auth/me", headers=auth_headers, timeout=15)
         assert r.status_code == 200, r.text

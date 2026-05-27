@@ -6,6 +6,7 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
+import { BlurView } from 'expo-blur';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import * as Haptics from 'expo-haptics';
 
@@ -63,6 +64,7 @@ export default function ChatScreen() {
   const [meterDeltas, setMeterDeltas] = useState<Partial<Meters> | null>(null);
   const [latestChapterTitle, setLatestChapterTitle] = useState<string | undefined>(undefined);
   const [showEnding, setShowEnding] = useState(false);
+  const [inputFocused, setInputFocused] = useState(false);
   const listRef = useRef<FlatList<Msg>>(null);
 
   const load = useCallback(async () => {
@@ -239,6 +241,23 @@ export default function ChatScreen() {
 
   return (
     <SafeAreaView style={styles.safe} edges={['top', 'bottom']} testID="chat-screen">
+      {character?.avatar ? (
+        <View style={StyleSheet.absoluteFill} pointerEvents="none">
+          <Image
+            source={{ uri: character.avatar }}
+            style={styles.backdropImg}
+            blurRadius={Platform.OS === 'web' ? 0 : 45}
+            resizeMode="cover"
+          />
+          <BlurView intensity={55} tint="dark" style={StyleSheet.absoluteFill} />
+          <LinearGradient
+            colors={['rgba(13,13,26,0.35)', 'rgba(13,13,26,0.72)', '#0D0D1A']}
+            locations={[0, 0.55, 1]}
+            style={StyleSheet.absoluteFill}
+          />
+        </View>
+      ) : null}
+
       <View style={styles.topBar}>
         <Pressable testID="chat-back-btn" hitSlop={12} onPress={() => router.back()} style={styles.iconBtn}>
           <Ionicons name="chevron-back" size={22} color="#fff" />
@@ -360,29 +379,33 @@ export default function ChatScreen() {
         />
 
         <View style={styles.composer}>
-          <TextInput
-            testID="chat-input"
-            value={draft}
-            onChangeText={setDraft}
-            placeholder={
-              storyState?.completed
-                ? 'The story has ended.'
-                : `Message ${character?.name?.split(' ')[0] || ''}…`
-            }
-            placeholderTextColor={Colors.textSecondary}
-            style={styles.input}
-            multiline
-            maxLength={2000}
-            editable={!storyState?.completed}
-          />
-          <Pressable
-            testID="chat-send-btn"
-            onPress={send}
-            disabled={!draft.trim() || sending || !!storyState?.completed}
-            style={[styles.sendBtn, (!draft.trim() || sending || !!storyState?.completed) && { opacity: 0.5 }]}
-          >
-            <Ionicons name="send" size={18} color="#fff" />
-          </Pressable>
+          <View style={[styles.inputBar, inputFocused && styles.inputBarFocused]}>
+            <TextInput
+              testID="chat-input"
+              value={draft}
+              onChangeText={setDraft}
+              onFocus={() => setInputFocused(true)}
+              onBlur={() => setInputFocused(false)}
+              placeholder={
+                storyState?.completed
+                  ? 'The story has ended.'
+                  : `Message ${character?.name?.split(' ')[0] || ''}…`
+              }
+              placeholderTextColor={Colors.textSecondary}
+              style={styles.input}
+              multiline
+              maxLength={2000}
+              editable={!storyState?.completed}
+            />
+            <Pressable
+              testID="chat-send-btn"
+              onPress={send}
+              disabled={!draft.trim() || sending || !!storyState?.completed}
+              style={[styles.sendBtn, (!draft.trim() || sending || !!storyState?.completed) && styles.sendBtnDisabled]}
+            >
+              <Ionicons name="arrow-up" size={20} color="#fff" />
+            </Pressable>
+          </View>
         </View>
       </KeyboardAvoidingView>
 
@@ -471,6 +494,7 @@ export default function ChatScreen() {
 
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: Colors.bgPrimary },
+  backdropImg: { ...StyleSheet.absoluteFillObject, width: '100%', height: '100%', opacity: 0.55 },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: Colors.bgPrimary },
   topBar: {
     flexDirection: 'row', alignItems: 'center',
@@ -523,22 +547,34 @@ const styles = StyleSheet.create({
   },
   msgActionText: { color: Colors.textSecondary, fontSize: 11, fontWeight: '500' },
   composer: {
-    flexDirection: 'row', alignItems: 'flex-end', gap: 8,
-    paddingHorizontal: 12, paddingTop: 8, paddingBottom: Platform.OS === 'ios' ? 4 : 10,
+    paddingHorizontal: 12, paddingTop: 8, paddingBottom: Platform.OS === 'ios' ? 8 : 12,
     borderTopWidth: 1, borderTopColor: Colors.borderSubtle,
     backgroundColor: Colors.bgPrimary,
   },
+  inputBar: {
+    flexDirection: 'row', alignItems: 'flex-end',
+    backgroundColor: Colors.inputBg,
+    borderRadius: 24,
+    borderWidth: 1, borderColor: Colors.borderDefault,
+    paddingLeft: 16, paddingRight: 6, paddingVertical: 6,
+  },
+  inputBarFocused: {
+    borderColor: Colors.brandPrimary,
+  },
   input: {
     flex: 1, color: '#fff',
-    backgroundColor: Colors.inputBg, borderRadius: Radius.lg,
-    paddingHorizontal: 14, paddingTop: 10, paddingBottom: 10,
-    borderWidth: 1, borderColor: Colors.borderDefault,
-    maxHeight: 120, fontSize: 15,
+    fontSize: 15, lineHeight: 20,
+    paddingTop: 8, paddingBottom: 8, paddingRight: 8,
+    maxHeight: 120,
+    ...(Platform.OS === 'web' ? { outlineStyle: 'none' as any } : {}),
   },
   sendBtn: {
-    width: 44, height: 44, borderRadius: 22,
+    width: 36, height: 36, borderRadius: 18,
     backgroundColor: Colors.brandPrimary,
     alignItems: 'center', justifyContent: 'center',
+  },
+  sendBtnDisabled: {
+    backgroundColor: Colors.borderDefault,
   },
   endingBackdrop: {
     flex: 1, backgroundColor: 'rgba(0,0,0,0.7)',

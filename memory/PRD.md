@@ -5,8 +5,8 @@ Inspired by Character.AI / PolyBuzz / Janitor.AI. React Native (Expo) + FastAPI/
 ## Stack
 - **Frontend:** Expo Router, TypeScript, expo-haptics, expo-linear-gradient, expo-blur
 - **Backend:** FastAPI + MongoDB (motor)
-- **AI:** Claude Sonnet 4.5 (chat) + Gemini Nano Banana (avatar gen) via Emergent Universal LLM Key
-- **Auth:** Emergent-managed Google OAuth
+- **AI:** Claude Sonnet 4.5 (chat + story engine) via OpenRouter; DALL-E 3 (avatar gen) via OpenAI API
+- **Auth:** Self-managed email/name dev login with backend-issued session tokens
 
 ## Feature Highlights
 ### Discover

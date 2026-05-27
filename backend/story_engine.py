@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from emergentintegrations.llm.chat import LlmChat, UserMessage
+from llm_client import complete
 
 logger = logging.getLogger(__name__)
 
@@ -101,13 +101,11 @@ def _clamp(val: int, lo: int = 0, hi: int = 100) -> int:
     return max(lo, min(hi, val))
 
 
-async def _llm_json_call(api_key: str, prompt: str) -> dict:
-    llm = LlmChat(
-        api_key=api_key,
-        session_id=f"story_{uuid.uuid4().hex[:8]}",
-        system_message="You are a JSON-only responder. Return only valid JSON, no markdown, no explanation.",
-    ).with_model("anthropic", "claude-sonnet-4-5-20250929")
-    raw = await llm.send_message(UserMessage(text=prompt))
+async def _llm_json_call(prompt: str) -> dict:
+    raw = await complete(
+        system="You are a JSON-only responder. Return only valid JSON, no markdown, no explanation.",
+        messages=[{"role": "user", "content": prompt}],
+    )
     raw = raw.strip()
     if raw.startswith("```"):
         raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
@@ -117,13 +115,13 @@ async def _llm_json_call(api_key: str, prompt: str) -> dict:
     return json.loads(raw)
 
 
-async def generate_story_arc(api_key: str, character: dict) -> dict:
+async def generate_story_arc(character: dict) -> dict:
     prompt = ARC_GENERATION_PROMPT.format(
         name=character["name"],
         genre=character.get("genre", "Fantasy"),
         personality=character.get("personality", "")[:500],
     )
-    arc_data = await _llm_json_call(api_key, prompt)
+    arc_data = await _llm_json_call(prompt)
     arc_id = str(uuid.uuid4())
     return {
         "id": arc_id,
@@ -151,7 +149,6 @@ def init_story_state(arc: dict) -> dict:
 
 
 async def evaluate_meters_and_choices(
-    api_key: str,
     user_msg: str,
     assistant_msg: str,
     current_meters: dict,
@@ -165,7 +162,7 @@ async def evaluate_meters_and_choices(
         assistant_msg=assistant_msg[:500],
     )
     try:
-        return await _llm_json_call(api_key, prompt)
+        return await _llm_json_call(prompt)
     except Exception:
         logger.exception("Meter evaluation failed, returning neutral")
         return {"meter_changes": {"trust": 0, "affection": 0, "rivalry": 0, "fear": 0}, "choice": None}
@@ -180,7 +177,6 @@ def apply_meter_changes(meters: dict, changes: dict) -> dict:
 
 
 async def check_chapter_advance(
-    api_key: str,
     arc: dict,
     story_state: dict,
 ) -> Optional[dict]:
@@ -215,7 +211,7 @@ async def check_chapter_advance(
         choices_text=choices_text,
     )
     try:
-        result = await _llm_json_call(api_key, prompt)
+        result = await _llm_json_call(prompt)
         if result.get("advance"):
             return result
     except Exception:
@@ -224,7 +220,6 @@ async def check_chapter_advance(
 
 
 async def evaluate_ending(
-    api_key: str,
     arc: dict,
     story_state: dict,
 ) -> dict:
@@ -246,7 +241,7 @@ async def evaluate_ending(
         choices_text=choices_text,
     )
     try:
-        return await _llm_json_call(api_key, prompt)
+        return await _llm_json_call(prompt)
     except Exception:
         logger.exception("Ending evaluation failed, defaulting to bad ending")
         return {"ending_type": "bad", "ending_summary": "The story reached an uncertain conclusion."}

@@ -83,6 +83,11 @@ android-sdk/
 .env
 .env.*
 *.env
+!.env.example
 credentials.json
 *.key
 .credentials
+
+# Expo / Metro
+frontend/.metro-cache/
+frontend/dist-preview/
