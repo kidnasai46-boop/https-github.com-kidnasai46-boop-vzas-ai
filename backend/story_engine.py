@@ -101,10 +101,11 @@ def _clamp(val: int, lo: int = 0, hi: int = 100) -> int:
     return max(lo, min(hi, val))
 
 
-async def _llm_json_call(prompt: str) -> dict:
+async def _llm_json_call(prompt: str, nsfw: bool = False) -> dict:
     raw = await complete(
         system="You are a JSON-only responder. Return only valid JSON, no markdown, no explanation.",
         messages=[{"role": "user", "content": prompt}],
+        nsfw=nsfw,
     )
     raw = raw.strip()
     if raw.startswith("```"):
@@ -116,12 +117,13 @@ async def _llm_json_call(prompt: str) -> dict:
 
 
 async def generate_story_arc(character: dict) -> dict:
+    nsfw = bool(character.get("nsfw"))
     prompt = ARC_GENERATION_PROMPT.format(
         name=character["name"],
         genre=character.get("genre", "Fantasy"),
         personality=character.get("personality", "")[:500],
     )
-    arc_data = await _llm_json_call(prompt)
+    arc_data = await _llm_json_call(prompt, nsfw=nsfw)
     arc_id = str(uuid.uuid4())
     return {
         "id": arc_id,
@@ -152,6 +154,7 @@ async def evaluate_meters_and_choices(
     user_msg: str,
     assistant_msg: str,
     current_meters: dict,
+    nsfw: bool = False,
 ) -> dict:
     prompt = METER_EVAL_PROMPT.format(
         trust=current_meters["trust"],
@@ -162,7 +165,7 @@ async def evaluate_meters_and_choices(
         assistant_msg=assistant_msg[:500],
     )
     try:
-        return await _llm_json_call(prompt)
+        return await _llm_json_call(prompt, nsfw=nsfw)
     except Exception:
         logger.exception("Meter evaluation failed, returning neutral")
         return {"meter_changes": {"trust": 0, "affection": 0, "rivalry": 0, "fear": 0}, "choice": None}
@@ -171,7 +174,15 @@ async def evaluate_meters_and_choices(
 def apply_meter_changes(meters: dict, changes: dict) -> dict:
     updated = dict(meters)
     for key in ("trust", "affection", "rivalry", "fear"):
-        delta = changes.get(key, 0)
+        raw = changes.get(key, 0)
+        # LLMs occasionally return strings like "+3" or "-2" instead of ints.
+        # Coerce defensively so a single bad delta never crashes the chat.
+        try:
+            if isinstance(raw, str):
+                raw = raw.strip().lstrip("+")
+            delta = int(raw or 0)
+        except (TypeError, ValueError):
+            delta = 0
         updated[key] = _clamp(updated[key] + delta)
     return updated
 
@@ -179,6 +190,7 @@ def apply_meter_changes(meters: dict, changes: dict) -> dict:
 async def check_chapter_advance(
     arc: dict,
     story_state: dict,
+    nsfw: bool = False,
 ) -> Optional[dict]:
     chapter_num = story_state["chapter"]
     chapter_info = None
@@ -211,7 +223,7 @@ async def check_chapter_advance(
         choices_text=choices_text,
     )
     try:
-        result = await _llm_json_call(prompt)
+        result = await _llm_json_call(prompt, nsfw=nsfw)
         if result.get("advance"):
             return result
     except Exception:
@@ -222,6 +234,7 @@ async def check_chapter_advance(
 async def evaluate_ending(
     arc: dict,
     story_state: dict,
+    nsfw: bool = False,
 ) -> dict:
     choices_text = "\n".join(
         f"- Ch.{c['chapter']}: {c['choice']} ({c['impact']})"
@@ -241,7 +254,7 @@ async def evaluate_ending(
         choices_text=choices_text,
     )
     try:
-        return await _llm_json_call(prompt)
+        return await _llm_json_call(prompt, nsfw=nsfw)
     except Exception:
         logger.exception("Ending evaluation failed, defaulting to bad ending")
         return {"ending_type": "bad", "ending_summary": "The story reached an uncertain conclusion."}

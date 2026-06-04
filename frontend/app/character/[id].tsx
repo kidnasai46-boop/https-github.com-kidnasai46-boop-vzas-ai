@@ -226,7 +226,7 @@ export default function CharacterScreen() {
       {/* Scenario picker modal */}
       <Modal visible={scenariosOpen} transparent animationType="slide" onRequestClose={() => setScenariosOpen(false)}>
         <Pressable style={styles.modalBackdrop} onPress={() => setScenariosOpen(false)}>
-          <Pressable style={styles.sheet} onPress={(e) => e.stopPropagation()}>
+          <View style={styles.sheet} onStartShouldSetResponder={() => true}>
             <View style={styles.sheetHandle} />
             <Text style={styles.sheetTitle}>Choose a scenario</Text>
             <Text style={styles.sheetSub}>Pick a starting point — or use the default greeting.</Text>
@@ -265,7 +265,7 @@ export default function CharacterScreen() {
                 </Pressable>
               ))}
             </ScrollView>
-          </Pressable>
+          </View>
         </Pressable>
       </Modal>
     </View>

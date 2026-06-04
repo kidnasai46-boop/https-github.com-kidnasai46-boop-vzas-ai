@@ -12,6 +12,10 @@ export interface AuthUser {
     gender?: string;
     bio?: string;
   };
+  is_subscribed?: boolean;
+  nsfw_messages_used?: number;
+  sfw_messages_today?: number;
+  sfw_count_date?: string | null;
 }
 
 interface AuthContextValue {

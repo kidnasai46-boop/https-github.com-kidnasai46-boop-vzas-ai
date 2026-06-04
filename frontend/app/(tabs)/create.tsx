@@ -22,11 +22,13 @@ interface FormState {
   avatar: string;
   genre: string;
   tags: string;
+  nsfw: boolean;
 }
 
 const empty: FormState = {
   name: '', tagline: '', description: '', personality: '',
   backstory: '', greeting: '', avatar: '', genre: 'Fantasy', tags: '',
+  nsfw: false,
 };
 
 export default function Create() {
@@ -52,8 +54,8 @@ export default function Create() {
       setGenerating(true);
       const data = await api<{ avatar: string }>('/characters/generate-avatar', {
         method: 'POST',
-        body: { prompt },
-        timeoutMs: 90000,
+        body: { prompt, nsfw: form.nsfw },
+        timeoutMs: 120000,
       });
       update('avatar', data.avatar);
     } catch (e: any) {
@@ -128,6 +130,24 @@ export default function Create() {
                   );
                 })}
               </View>
+
+              <Pressable
+                testID="create-nsfw-toggle"
+                onPress={() => setForm((f) => ({ ...f, nsfw: !f.nsfw }))}
+                style={[styles.nsfwRow, form.nsfw && styles.nsfwRowActive]}
+              >
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.nsfwTitle}>Mature content (18+)</Text>
+                  <Text style={styles.nsfwHelp}>
+                    {form.nsfw
+                      ? 'Routed to an uncensored model. Allows explicit adult roleplay.'
+                      : 'Off — character uses Claude with tasteful, SFW boundaries.'}
+                  </Text>
+                </View>
+                <View style={[styles.toggle, form.nsfw && styles.toggleOn]}>
+                  <View style={[styles.toggleThumb, form.nsfw && styles.toggleThumbOn]} />
+                </View>
+              </Pressable>
             </View>
           )}
 
@@ -268,6 +288,26 @@ const styles = StyleSheet.create({
     borderWidth: 1, borderColor: Colors.borderDefault,
   },
   chipActive: { backgroundColor: Colors.brandPrimary, borderColor: Colors.brandPrimary },
+  nsfwRow: {
+    flexDirection: 'row', alignItems: 'center', gap: 12,
+    paddingVertical: 14, paddingHorizontal: 16,
+    backgroundColor: Colors.inputBg, borderRadius: Radius.md,
+    borderWidth: 1, borderColor: Colors.borderDefault,
+  },
+  nsfwRowActive: { borderColor: '#EF4444' },
+  nsfwTitle: { color: '#fff', fontSize: 15, fontWeight: '600' },
+  nsfwHelp: { color: Colors.textSecondary, fontSize: 12, marginTop: 4, lineHeight: 16 },
+  toggle: {
+    width: 44, height: 26, borderRadius: 13,
+    backgroundColor: 'rgba(255,255,255,0.15)',
+    padding: 2, justifyContent: 'center',
+  },
+  toggleOn: { backgroundColor: '#EF4444' },
+  toggleThumb: {
+    width: 22, height: 22, borderRadius: 11,
+    backgroundColor: '#fff',
+  },
+  toggleThumbOn: { transform: [{ translateX: 18 }] },
   chipText: { color: Colors.textSecondary, fontSize: 13, fontWeight: '500' },
   chipTextActive: { color: '#fff' },
   avatarPreview: {

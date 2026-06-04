@@ -1,11 +1,24 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Header, Depends
+# Use the OS trust store for SSL (Windows Certificate Store on Windows).
+# Without this, an HTTPS-inspecting antivirus / corporate proxy that re-signs
+# certificates will cause every outbound HTTPS call to fail verification.
+import truststore
+truststore.inject_into_ssl()
+
+# Load .env BEFORE any local imports — llm_client reads env vars at import
+# time, so the file must be loaded first or the LLM client will see empty keys.
+from pathlib import Path
 from dotenv import load_dotenv
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
+
+from fastapi import FastAPI, APIRouter, HTTPException, Header, Depends
+from fastapi.responses import StreamingResponse
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
+import json
 import logging
 import httpx
-from pathlib import Path
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 import uuid
@@ -13,9 +26,8 @@ import base64
 import secrets
 from datetime import datetime, timezone, timedelta
 
-from openai import AsyncOpenAI
-
-from llm_client import complete
+from llm_client import complete, stream as llm_stream
+from image_client import generate_avatar as replicate_avatar, is_configured as image_is_configured
 from seed_data import SEED_CHARACTERS
 from story_engine import (
     generate_story_arc, init_story_state, evaluate_meters_and_choices,
@@ -23,15 +35,9 @@ from story_engine import (
     build_story_prompt_block,
 )
 
-ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
-
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
-
-OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
-openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
@@ -54,6 +60,12 @@ class User(BaseModel):
     name: str
     picture: Optional[str] = None
     persona: Persona = Field(default_factory=Persona)
+    is_subscribed: bool = False
+    # Lifetime NSFW message counter — capped at FREE_NSFW_LIMIT for unsubscribed users.
+    nsfw_messages_used: int = 0
+    # Per-day SFW message counter — resets when sfw_count_date != today.
+    sfw_messages_today: int = 0
+    sfw_count_date: Optional[str] = None  # "YYYY-MM-DD" UTC
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -84,6 +96,7 @@ class Character(BaseModel):
     scenarios: List[Scenario] = []
     creator_id: Optional[str] = None
     is_official: bool = False
+    nsfw: bool = False
     chat_count: int = 0
     favorite_count: int = 0
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -101,10 +114,12 @@ class CharacterCreate(BaseModel):
     category: Optional[str] = "Original"
     tags: List[str] = []
     scenarios: List[Scenario] = []
+    nsfw: bool = False
 
 
 class AvatarGenRequest(BaseModel):
     prompt: str
+    nsfw: bool = False
 
 
 class Message(BaseModel):
@@ -240,6 +255,7 @@ async def list_characters(
     genre: Optional[str] = None,
     search: Optional[str] = None,
     favorites_only: bool = False,
+    nsfw: Optional[bool] = None,
     limit: int = 200,
     user: Optional[dict] = Depends(get_current_user_optional),
 ):
@@ -254,6 +270,11 @@ async def list_characters(
             {"tagline": {"$regex": search, "$options": "i"}},
             {"tags": {"$regex": search, "$options": "i"}},
         ]
+    # NSFW gating: default (param omitted) hides NSFW characters. Pass ?nsfw=true
+    # to include them, or ?nsfw=false to explicitly request SFW only.
+    if nsfw is None or nsfw is False:
+        q["$and"] = q.get("$and", []) + [{"$or": [{"nsfw": {"$exists": False}}, {"nsfw": False}]}]
+    # If nsfw is True we don't add a filter — both SFW and NSFW characters return.
 
     if favorites_only:
         if not user:
@@ -283,8 +304,14 @@ async def list_characters(
 
 
 @api_router.get("/characters/featured")
-async def featured_characters(user: Optional[dict] = Depends(get_current_user_optional)):
-    docs = await db.characters.find({"is_official": True}, {"_id": 0}).sort("chat_count", -1).limit(8).to_list(8)
+async def featured_characters(
+    nsfw: Optional[bool] = None,
+    user: Optional[dict] = Depends(get_current_user_optional),
+):
+    q: Dict[str, Any] = {"is_official": True}
+    if not nsfw:
+        q["$or"] = [{"nsfw": {"$exists": False}}, {"nsfw": False}]
+    docs = await db.characters.find(q, {"_id": 0}).sort("chat_count", -1).limit(8).to_list(8)
     if user and docs:
         char_ids = [d["id"] for d in docs]
         fav_set = {f["character_id"] async for f in db.favorites.find(
@@ -299,10 +326,16 @@ async def featured_characters(user: Optional[dict] = Depends(get_current_user_op
 
 
 @api_router.get("/characters/trending")
-async def trending_characters(user: Optional[dict] = Depends(get_current_user_optional)):
+async def trending_characters(
+    nsfw: Optional[bool] = None,
+    user: Optional[dict] = Depends(get_current_user_optional),
+):
     """Sorted by chat_count + favorite_count, limited to 10."""
+    match: Dict[str, Any] = {"is_official": True}
+    if not nsfw:
+        match["$or"] = [{"nsfw": {"$exists": False}}, {"nsfw": False}]
     pipeline = [
-        {"$match": {"is_official": True}},
+        {"$match": match},
         {"$addFields": {"_score": {"$add": [
             {"$ifNull": ["$chat_count", 0]},
             {"$multiply": [{"$ifNull": ["$favorite_count", 0]}, 3]},
@@ -392,38 +425,88 @@ async def unfavorite_character(char_id: str, user: dict = Depends(get_current_us
 
 @api_router.post("/characters/generate-avatar")
 async def generate_avatar(req: AvatarGenRequest, user: dict = Depends(get_current_user)):
-    """Generate an avatar with OpenAI DALL-E 3. Requires OPENAI_API_KEY."""
-    if not openai_client:
-        raise HTTPException(status_code=400, detail="Image generation not configured")
+    """Generate a character avatar via Replicate.
 
-    prompt_text = (
-        "Cinematic close-up character portrait, fictional persona, no celebrities, "
-        "vertical 1:1 framing, dramatic moody lighting, ultra-detailed, digital art style. "
-        f"Character description: {req.prompt}"
-    )
+    Uses a Hugging Face image model hosted on Replicate. Picks an anime+NSFW
+    model when `req.nsfw=True` (Pony Diffusion v6 XL by default) or a general
+    cinematic model when False (Flux Schnell by default). Both slugs are
+    env-configurable: REPLICATE_MODEL / REPLICATE_NSFW_MODEL.
+    """
+    if not image_is_configured():
+        raise HTTPException(status_code=400, detail="Image generation not configured — set REPLICATE_API_TOKEN")
     try:
-        response = await openai_client.images.generate(
-            model="dall-e-3",
-            prompt=prompt_text,
-            size="1024x1024",
-            quality="standard",
-            style="vivid",
-            n=1,
-        )
-        image_url = response.data[0].url
-        async with httpx.AsyncClient(timeout=60) as http:
-            img_resp = await http.get(image_url)
-            img_resp.raise_for_status()
-        b64 = base64.b64encode(img_resp.content).decode("utf-8")
-        return {"avatar": f"data:image/png;base64,{b64}"}
+        data_uri = await replicate_avatar(req.prompt, nsfw=req.nsfw)
+        return {"avatar": data_uri}
     except HTTPException:
         raise
     except Exception as e:
-        if "content_policy" in str(e).lower() or "safety" in str(e).lower():
-            logger.warning(f"OpenAI content policy rejection: {e}")
+        msg = str(e).lower()
+        if "nsfw" in msg or "safety" in msg or "content" in msg:
+            logger.warning(f"Image model rejection: {e}")
             raise HTTPException(status_code=400, detail="Could not generate this image. Try adjusting the description.")
         logger.exception("Avatar generation failed")
         raise HTTPException(status_code=500, detail=f"Avatar generation failed: {str(e)}")
+
+
+# ---------- Quota / paywall ----------
+# Free tier limits. Subscribed users are uncapped on both.
+FREE_NSFW_LIMIT = 5            # lifetime NSFW messages for unsubscribed users
+FREE_SFW_DAILY_LIMIT = 50      # SFW messages per UTC day for unsubscribed users
+
+
+def _today_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+async def _check_quota(user: dict, char: dict) -> Optional[dict]:
+    """Return None if the user can send another message, else a paywall dict
+    {kind, limit, used} describing why they're blocked.
+
+    Subscribed users always pass. Otherwise:
+      - NSFW character → lifetime cap (FREE_NSFW_LIMIT).
+      - SFW character  → per-UTC-day cap (FREE_SFW_DAILY_LIMIT), auto-reset
+        when the user's `sfw_count_date` differs from today.
+    """
+    if user.get("is_subscribed"):
+        return None
+    if char.get("nsfw"):
+        used = int(user.get("nsfw_messages_used", 0) or 0)
+        if used >= FREE_NSFW_LIMIT:
+            return {"kind": "nsfw", "limit": FREE_NSFW_LIMIT, "used": used}
+        return None
+    # SFW path — check daily cap with auto-reset.
+    today = _today_utc()
+    if user.get("sfw_count_date") != today:
+        used = 0  # will be reset on increment
+    else:
+        used = int(user.get("sfw_messages_today", 0) or 0)
+    if used >= FREE_SFW_DAILY_LIMIT:
+        return {"kind": "sfw_daily", "limit": FREE_SFW_DAILY_LIMIT, "used": used}
+    return None
+
+
+async def _increment_message_count(user: dict, char: dict) -> None:
+    """Bump the right counter after a successful reply. No-op for subscribers."""
+    if user.get("is_subscribed"):
+        return
+    if char.get("nsfw"):
+        await db.users.update_one(
+            {"user_id": user["user_id"]},
+            {"$inc": {"nsfw_messages_used": 1}},
+        )
+    else:
+        today = _today_utc()
+        if user.get("sfw_count_date") != today:
+            # Date rolled over — reset to 1.
+            await db.users.update_one(
+                {"user_id": user["user_id"]},
+                {"$set": {"sfw_messages_today": 1, "sfw_count_date": today}},
+            )
+        else:
+            await db.users.update_one(
+                {"user_id": user["user_id"]},
+                {"$inc": {"sfw_messages_today": 1}},
+            )
 
 
 # ---------- Chats ----------
@@ -453,6 +536,28 @@ def build_system_prompt(char: dict, user: dict, scenario: Optional[dict], story_
             f"{scenario.get('description', '')}\n"
         )
 
+    nsfw = bool(char.get("nsfw"))
+    if nsfw:
+        boundaries = (
+            "TONE: Adult roleplay — sensual, intimate, and emotionally charged. "
+            "Lean fully into chemistry, desire, and physical connection when the moment calls for it. "
+            "Match the character's personality and let scenes build naturally.\n\n"
+            "CONTENT BOUNDARIES (hard limits, never cross): "
+            "No minors in any sexual or romantic context — all characters and situations involve adults (18+). "
+            "No non-consensual acts. No sexual violence depicted as desirable. "
+            "No incest, no bestiality, no content that would be illegal in major jurisdictions."
+        )
+    else:
+        boundaries = (
+            "TONE: Match the character's personality. For romantic / flirty / sensual characters, "
+            "lean fully into chemistry — sustained eye contact, charged silences, lingering touches, "
+            "slow-building tension, longing, suggestive banter, kisses, embraces, intimate "
+            "atmosphere. Be confident, magnetic, evocative. Romance should feel real and earned.\n\n"
+            "CONTENT BOUNDARIES (always): Keep content tasteful and SFW. Suggest rather than depict "
+            "any explicit sexual acts — fade to black with sensual implication, never graphic detail. "
+            "No minors in any romantic/sensual context. No non-consent. For non-romantic characters "
+            "(therapists, coaches, mentors), stay professional and warm — do not force romantic tone."
+        )
     base = (
         f"You are roleplaying as {char['name']}.\n"
         f"Tagline: {char.get('tagline', '')}\n"
@@ -464,45 +569,41 @@ def build_system_prompt(char: dict, user: dict, scenario: Optional[dict], story_
         "Keep replies engaging, 1-4 sentences typically, immersive, and emotionally rich. "
         "Use *italic asterisks* for actions/expressions sparingly. "
         "Never break character or mention you are an AI. Adapt to the user's narrative direction.\n\n"
-        "TONE: Match the character's personality. For romantic / flirty / sensual characters, "
-        "lean fully into chemistry — sustained eye contact, charged silences, lingering touches, "
-        "slow-building tension, longing, suggestive banter, kisses, embraces, intimate "
-        "atmosphere. Be confident, magnetic, evocative. Romance should feel real and earned.\n\n"
-        "CONTENT BOUNDARIES (always): Keep content tasteful and SFW. Suggest rather than depict "
-        "any explicit sexual acts — fade to black with sensual implication, never graphic detail. "
-        "No minors in any romantic/sensual context. No non-consent. For non-romantic characters "
-        "(therapists, coaches, mentors), stay professional and warm — do not force romantic tone."
+        f"{boundaries}"
     )
     if story_block:
         base += "\n" + story_block
     return base
 
 
-async def _generate_assistant_reply(chat_id: str, char: dict, user: dict, scenario: Optional[dict],
-                                    history: List[dict], story_block: str = "") -> str:
-    """Build the conversation from history and get a fresh Claude reply.
+LLM_FALLBACK_REPLY = "*looks away thoughtfully* Sorry, my mind drifted for a moment. Could you say that again?"
 
-    The history is mapped to Anthropic message format. System/transition
-    messages are skipped. The last entry is the new user prompt.
+
+async def _generate_assistant_reply(chat_id: str, char: dict, user: dict, scenario: Optional[dict],
+                                    history: List[dict], story_block: str = "") -> tuple[str, bool]:
+    """Build the conversation from history and get a fresh reply.
+
+    Returns (reply_text, success). On LLM failure returns (FALLBACK, False)
+    so the caller can persist the in-character apology without charging the
+    user's quota or running the story engine on a non-existent reply.
     """
+    nsfw = bool(char.get("nsfw"))
     system_message = build_system_prompt(char, user, scenario, story_block=story_block)
     messages = [
         {"role": m["role"], "content": m["content"]}
         for m in history
         if m.get("role") in ("user", "assistant") and m.get("content")
     ]
-    # Anthropic requires the conversation to start with a user turn; the
-    # character's greeting is an assistant message, so drop any leading
-    # assistant turns.
     while messages and messages[0]["role"] == "assistant":
         messages.pop(0)
     if not messages:
         messages = [{"role": "user", "content": history[-1]["content"]}]
     try:
-        return await complete(system_message, messages, max_tokens=1024)
+        text = await complete(system_message, messages, max_tokens=1024, nsfw=nsfw)
+        return text, True
     except Exception:
         logger.exception("LLM call failed")
-        return "*looks away thoughtfully* Sorry, my mind drifted for a moment. Could you say that again?"
+        return LLM_FALLBACK_REPLY, False
 
 
 @api_router.get("/chats")
@@ -585,6 +686,127 @@ async def get_chat(chat_id: str, user: dict = Depends(get_current_user)):
     return {"chat": chat, "character": char, "messages": messages}
 
 
+def _sse(event: str, data: Optional[dict] = None) -> bytes:
+    """Format a Server-Sent Event frame. `data` is JSON-encoded; datetimes -> str."""
+    payload = json.dumps(data, default=str) if data is not None else ""
+    return f"event: {event}\ndata: {payload}\n\n".encode("utf-8")
+
+
+async def _process_story_after_message(
+    chat_id: str,
+    chat: dict,
+    char: dict,
+    user_content: str,
+    reply_text: str,
+) -> Optional[dict]:
+    """Wrapper around story engine processing that swallows any exception.
+
+    The story engine makes LLM JSON calls that occasionally return malformed
+    payloads; we never want a story-engine glitch to break the chat stream
+    or wedge the chat UI. On error → log + return None (no story update for
+    this turn) so the chat continues normally.
+    """
+    try:
+        return await _process_story_after_message_inner(
+            chat_id, chat, char, user_content, reply_text,
+        )
+    except Exception:
+        logger.exception("Story engine post-processing failed; continuing without story update")
+        return None
+
+
+async def _process_story_after_message_inner(
+    chat_id: str,
+    chat: dict,
+    char: dict,
+    user_content: str,
+    reply_text: str,
+) -> Optional[dict]:
+    """Run meter eval + chapter-advance / ending evaluation for an active story.
+
+    Mutates and persists the chat's story_state, inserts any chapter-transition
+    system message, and returns the story_state response dict the client uses
+    to update meters / show transitions. None when no active story.
+    """
+    if not chat.get("story_state") or chat["story_state"].get("completed"):
+        return None
+
+    nsfw = bool(char.get("nsfw"))
+    ss = dict(chat["story_state"])
+    ss["messages_in_chapter"] = ss.get("messages_in_chapter", 0) + 1
+
+    eval_result = await evaluate_meters_and_choices(
+        user_content, reply_text, ss["meters"], nsfw=nsfw,
+    )
+    ss["meters"] = apply_meter_changes(ss["meters"], eval_result.get("meter_changes", {}))
+
+    if eval_result.get("choice"):
+        choice = eval_result["choice"]
+        choice["chapter"] = ss["chapter"]
+        choice["message_index"] = ss["messages_in_chapter"]
+        ss["choices_made"].append(choice)
+
+    story_response: dict = {
+        "chapter": ss["chapter"],
+        "meters": ss["meters"],
+        "chapter_transition": None,
+    }
+
+    arc = await db.story_arcs.find_one({"id": ss["arc_id"]}, {"_id": 0})
+    if arc:
+        if ss["chapter"] >= ss["total_chapters"]:
+            chapter_info = None
+            for ch in arc["chapters"]:
+                if ch["number"] == ss["chapter"]:
+                    chapter_info = ch
+                    break
+            target = chapter_info.get("target_messages", 15) if chapter_info else 15
+            if ss["messages_in_chapter"] >= target:
+                ending = await evaluate_ending(arc, ss, nsfw=nsfw)
+                ss["ending"] = ending.get("ending_type", "bad")
+                ss["completed"] = True
+                transition_msg = Message(
+                    chat_id=chat_id, role="system",
+                    content=f"Story Complete: {ending.get('ending_summary', '')}",
+                ).dict()
+                transition_msg["type"] = "chapter_transition"
+                transition_msg["chapter_summary"] = ending.get("ending_summary", "")
+                transition_msg["meters_snapshot"] = dict(ss["meters"])
+                await db.messages.insert_one(dict(transition_msg))
+                story_response["chapter_transition"] = {
+                    "title": f"Story Complete — {ss['ending'].title()} Ending",
+                    "summary": ending.get("ending_summary", ""),
+                }
+                story_response["ending"] = ss["ending"]
+                story_response["completed"] = True
+        else:
+            advance = await check_chapter_advance(arc, ss, nsfw=nsfw)
+            if advance:
+                ss["chapter"] += 1
+                ss["messages_in_chapter"] = 0
+                next_ch = None
+                for ch in arc["chapters"]:
+                    if ch["number"] == ss["chapter"]:
+                        next_ch = ch
+                        break
+                transition_msg = Message(
+                    chat_id=chat_id, role="system",
+                    content=f"Chapter {ss['chapter']}: {next_ch['title'] if next_ch else ''}",
+                ).dict()
+                transition_msg["type"] = "chapter_transition"
+                transition_msg["chapter_summary"] = advance.get("chapter_summary", "")
+                transition_msg["meters_snapshot"] = dict(ss["meters"])
+                await db.messages.insert_one(dict(transition_msg))
+                story_response["chapter_transition"] = {
+                    "title": f"Chapter {ss['chapter']}: {next_ch['title'] if next_ch else ''}",
+                    "summary": advance.get("chapter_summary", ""),
+                    "previous_chapter": advance.get("chapter_summary", ""),
+                }
+
+    await db.chats.update_one({"id": chat_id}, {"$set": {"story_state": ss}})
+    return story_response
+
+
 @api_router.post("/chats/{chat_id}/messages")
 async def send_message(chat_id: str, req: SendMessageRequest, user: dict = Depends(get_current_user)):
     chat = await db.chats.find_one({"id": chat_id, "user_id": user["user_id"]}, {"_id": 0})
@@ -593,6 +815,12 @@ async def send_message(chat_id: str, req: SendMessageRequest, user: dict = Depen
     char = await db.characters.find_one({"id": chat["character_id"]}, {"_id": 0})
     if not char:
         raise HTTPException(status_code=404, detail="Character not found")
+
+    # Paywall — check BEFORE inserting the user message so they don't see a
+    # ghost message with no reply.
+    paywall = await _check_quota(user, char)
+    if paywall:
+        raise HTTPException(status_code=402, detail={"paywall": paywall})
 
     user_msg = Message(chat_id=chat_id, role="user", content=req.content).dict()
     await db.messages.insert_one(dict(user_msg))
@@ -612,85 +840,16 @@ async def send_message(chat_id: str, req: SendMessageRequest, user: dict = Depen
         if arc:
             story_block = build_story_prompt_block(arc, chat["story_state"])
 
-    reply_text = await _generate_assistant_reply(chat_id, char, user, scenario, history, story_block=story_block)
+    reply_text, llm_ok = await _generate_assistant_reply(chat_id, char, user, scenario, history, story_block=story_block)
 
     assistant_msg = Message(chat_id=chat_id, role="assistant", content=reply_text).dict()
     await db.messages.insert_one(dict(assistant_msg))
 
+    # Only charge quota + run the story engine when the model actually replied.
     story_response = None
-    if chat.get("story_state") and not chat["story_state"].get("completed"):
-        ss = dict(chat["story_state"])
-        ss["messages_in_chapter"] = ss.get("messages_in_chapter", 0) + 1
-
-        eval_result = await evaluate_meters_and_choices(
-            req.content, reply_text, ss["meters"]
-        )
-        ss["meters"] = apply_meter_changes(ss["meters"], eval_result.get("meter_changes", {}))
-
-        if eval_result.get("choice"):
-            choice = eval_result["choice"]
-            choice["chapter"] = ss["chapter"]
-            choice["message_index"] = ss["messages_in_chapter"]
-            ss["choices_made"].append(choice)
-
-        story_response = {
-            "chapter": ss["chapter"],
-            "meters": ss["meters"],
-            "chapter_transition": None,
-        }
-
-        arc = await db.story_arcs.find_one({"id": ss["arc_id"]}, {"_id": 0})
-        if arc:
-            if ss["chapter"] >= ss["total_chapters"]:
-                chapter_info = None
-                for ch in arc["chapters"]:
-                    if ch["number"] == ss["chapter"]:
-                        chapter_info = ch
-                        break
-                target = chapter_info.get("target_messages", 15) if chapter_info else 15
-                if ss["messages_in_chapter"] >= target:
-                    ending = await evaluate_ending(arc, ss)
-                    ss["ending"] = ending.get("ending_type", "bad")
-                    ss["completed"] = True
-                    transition_msg = Message(
-                        chat_id=chat_id, role="system",
-                        content=f"Story Complete: {ending.get('ending_summary', '')}",
-                    ).dict()
-                    transition_msg["type"] = "chapter_transition"
-                    transition_msg["chapter_summary"] = ending.get("ending_summary", "")
-                    transition_msg["meters_snapshot"] = dict(ss["meters"])
-                    await db.messages.insert_one(dict(transition_msg))
-                    story_response["chapter_transition"] = {
-                        "title": f"Story Complete — {ss['ending'].title()} Ending",
-                        "summary": ending.get("ending_summary", ""),
-                    }
-                    story_response["ending"] = ss["ending"]
-                    story_response["completed"] = True
-            else:
-                advance = await check_chapter_advance(arc, ss)
-                if advance:
-                    ss["chapter"] += 1
-                    ss["messages_in_chapter"] = 0
-                    next_ch = None
-                    for ch in arc["chapters"]:
-                        if ch["number"] == ss["chapter"]:
-                            next_ch = ch
-                            break
-                    transition_msg = Message(
-                        chat_id=chat_id, role="system",
-                        content=f"Chapter {ss['chapter']}: {next_ch['title'] if next_ch else ''}",
-                    ).dict()
-                    transition_msg["type"] = "chapter_transition"
-                    transition_msg["chapter_summary"] = advance.get("chapter_summary", "")
-                    transition_msg["meters_snapshot"] = dict(ss["meters"])
-                    await db.messages.insert_one(dict(transition_msg))
-                    story_response["chapter_transition"] = {
-                        "title": f"Chapter {ss['chapter']}: {next_ch['title'] if next_ch else ''}",
-                        "summary": advance.get("chapter_summary", ""),
-                        "previous_chapter": advance.get("chapter_summary", ""),
-                    }
-
-        await db.chats.update_one({"id": chat_id}, {"$set": {"story_state": ss}})
+    if llm_ok:
+        await _increment_message_count(user, char)
+        story_response = await _process_story_after_message(chat_id, chat, char, req.content, reply_text)
 
     await db.chats.update_one(
         {"id": chat_id},
@@ -701,6 +860,122 @@ async def send_message(chat_id: str, req: SendMessageRequest, user: dict = Depen
     if story_response:
         response["story_state"] = story_response
     return response
+
+
+@api_router.post("/chats/{chat_id}/messages/stream")
+async def send_message_stream(chat_id: str, req: SendMessageRequest, user: dict = Depends(get_current_user)):
+    """Stream the assistant's reply via Server-Sent Events.
+
+    Event order:
+      meta  -> {user_message, assistant_message_id}
+      delta -> {text}          (many, one per LLM chunk)
+      story -> {chapter, meters, chapter_transition?, ending?, completed?}  (optional)
+      done  -> {}              (always last)
+    """
+    chat = await db.chats.find_one({"id": chat_id, "user_id": user["user_id"]}, {"_id": 0})
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    char = await db.characters.find_one({"id": chat["character_id"]}, {"_id": 0})
+    if not char:
+        raise HTTPException(status_code=404, detail="Character not found")
+
+    # Paywall check FIRST — before we persist the user message or open the SSE
+    # stream. A 402 response is delivered as a normal JSON error, so the
+    # client's onError handler picks it up cleanly.
+    paywall = await _check_quota(user, char)
+    if paywall:
+        raise HTTPException(status_code=402, detail={"paywall": paywall})
+
+    # Persist the user message immediately so refreshes / parallel reads see it.
+    user_msg = Message(chat_id=chat_id, role="user", content=req.content).dict()
+    await db.messages.insert_one(dict(user_msg))
+
+    history = await db.messages.find({"chat_id": chat_id}, {"_id": 0}).sort("created_at", 1).to_list(1000)
+
+    scenario = None
+    if chat.get("scenario_id"):
+        for sc in (char.get("scenarios") or []):
+            if sc.get("id") == chat["scenario_id"]:
+                scenario = sc
+                break
+
+    story_block = ""
+    if chat.get("story_state") and not chat["story_state"].get("completed"):
+        arc = await db.story_arcs.find_one({"id": chat["story_state"]["arc_id"]}, {"_id": 0})
+        if arc:
+            story_block = build_story_prompt_block(arc, chat["story_state"])
+
+    nsfw = bool(char.get("nsfw"))
+    assistant_id = str(uuid.uuid4())
+
+    async def event_gen():
+        system_message = build_system_prompt(char, user, scenario, story_block=story_block)
+        msgs = [
+            {"role": m["role"], "content": m["content"]}
+            for m in history
+            if m.get("role") in ("user", "assistant") and m.get("content")
+        ]
+        while msgs and msgs[0]["role"] == "assistant":
+            msgs.pop(0)
+        if not msgs:
+            msgs = [{"role": "user", "content": req.content}]
+
+        yield _sse("meta", {
+            "user_message": user_msg,
+            "assistant_message_id": assistant_id,
+        })
+
+        full_reply = ""
+        llm_ok = True
+        try:
+            async for chunk in llm_stream(system_message, msgs, max_tokens=1024, nsfw=nsfw):
+                full_reply += chunk
+                yield _sse("delta", {"text": chunk})
+        except Exception:
+            logger.exception("Streaming LLM call failed")
+            llm_ok = False
+            full_reply = LLM_FALLBACK_REPLY
+            yield _sse("delta", {"text": LLM_FALLBACK_REPLY})
+
+        # Wrap everything after the LLM call in a try/except so a story-engine
+        # or DB hiccup still emits a clean error+done frame to the client
+        # instead of an abrupt EOS that leaves the UI wedged.
+        try:
+            assistant_msg = {
+                "id": assistant_id,
+                "chat_id": chat_id,
+                "role": "assistant",
+                "content": full_reply,
+                "created_at": datetime.now(timezone.utc),
+            }
+            await db.messages.insert_one(dict(assistant_msg))
+
+            # Only charge quota + run the story engine when the LLM succeeded.
+            if llm_ok:
+                await _increment_message_count(user, char)
+                story_response = await _process_story_after_message(chat_id, chat, char, req.content, full_reply)
+                if story_response:
+                    yield _sse("story", story_response)
+
+            await db.chats.update_one(
+                {"id": chat_id},
+                {"$set": {"last_message": full_reply[:200], "last_message_at": datetime.now(timezone.utc)}},
+            )
+        except Exception as post_err:
+            logger.exception("Stream post-processing failed")
+            yield _sse("error", {"message": f"post-processing failed: {str(post_err)[:120]}"})
+
+        yield _sse("done", {})
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @api_router.post("/chats/{chat_id}/regenerate")
@@ -745,7 +1020,7 @@ async def regenerate_message(chat_id: str, user: dict = Depends(get_current_user
                 scenario = sc
                 break
 
-    reply_text = await _generate_assistant_reply(chat_id, char, user, scenario, history)
+    reply_text, _ = await _generate_assistant_reply(chat_id, char, user, scenario, history)
     new_msg = Message(chat_id=chat_id, role="assistant", content=reply_text).dict()
     await db.messages.insert_one(dict(new_msg))
     await db.chats.update_one(
@@ -753,6 +1028,80 @@ async def regenerate_message(chat_id: str, user: dict = Depends(get_current_user
         {"$set": {"last_message": reply_text[:200], "last_message_at": datetime.now(timezone.utc)}},
     )
     return {"assistant_message": new_msg}
+
+
+class InChatImageRequest(BaseModel):
+    hint: Optional[str] = None  # Optional user-supplied scene hint
+
+
+@api_router.post("/chats/{chat_id}/image")
+async def in_chat_image(chat_id: str, req: InChatImageRequest, user: dict = Depends(get_current_user)):
+    """Generate an in-chat image of the character — a 'selfie' driven by the
+    user tapping the camera button. Subscriber-only (paid feature) because
+    image generation is the most expensive call we make (~$0.01 per image).
+
+    The image is stored as a regular message in the chat with type=image so
+    the frontend can render it as an `<Image>` inside the bubble stream.
+    """
+    if not user.get("is_subscribed"):
+        raise HTTPException(
+            status_code=402,
+            detail={"paywall": {"kind": "image_premium", "feature": "in_chat_image"}},
+        )
+
+    chat = await db.chats.find_one({"id": chat_id, "user_id": user["user_id"]}, {"_id": 0})
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    char = await db.characters.find_one({"id": chat["character_id"]}, {"_id": 0})
+    if not char:
+        raise HTTPException(status_code=404, detail="Character not found")
+
+    # Build the prompt. If the user typed a specific hint, that's the
+    # dominant signal — describe THAT image. If they didn't, fall back to a
+    # scene-aware candid selfie based on the last few messages of context.
+    hint = (req.hint or "").strip()
+    parts = [char["name"], char.get("tagline", "")]
+    physical_hint = (char.get("description") or "")[:200]
+    if physical_hint:
+        parts.append(physical_hint)
+
+    if hint:
+        # User-driven: their request is the focus, character is the subject.
+        parts.append(f"Scene: {hint}")
+        parts.append("looking at the camera, photo as if sent by her, intimate framing")
+    else:
+        # No hint → use last 4 messages as scene context for an in-the-moment selfie.
+        recent = await db.messages.find({"chat_id": chat_id}, {"_id": 0}).sort("created_at", -1).limit(4).to_list(4)
+        recent.reverse()
+        scene_lines = [
+            (m["content"][:120])
+            for m in recent
+            if m.get("role") in ("user", "assistant") and m.get("content")
+        ]
+        if scene_lines:
+            parts.append(f"Current scene: {' | '.join(scene_lines)}")
+        parts.append("casual candid selfie, in-the-moment, looking at the camera, intimate framing")
+    prompt = ". ".join(p for p in parts if p)
+
+    try:
+        data_uri = await replicate_avatar(prompt, nsfw=bool(char.get("nsfw")))
+    except Exception as e:
+        logger.exception("In-chat image generation failed")
+        raise HTTPException(status_code=500, detail=f"Image generation failed: {str(e)[:120]}")
+
+    # Persist as a regular assistant message of type=image. Content is the
+    # data URI so the frontend can render it via <Image src={content} />.
+    image_msg = Message(chat_id=chat_id, role="assistant", content=data_uri).dict()
+    image_msg["type"] = "image"
+    await db.messages.insert_one(dict(image_msg))
+
+    # Update chat metadata so the list shows "📷 sent a photo" or similar.
+    await db.chats.update_one(
+        {"id": chat_id},
+        {"$set": {"last_message": "📷 Sent a photo", "last_message_at": datetime.now(timezone.utc)}},
+    )
+
+    return {"assistant_message": image_msg}
 
 
 @api_router.delete("/chats/{chat_id}")

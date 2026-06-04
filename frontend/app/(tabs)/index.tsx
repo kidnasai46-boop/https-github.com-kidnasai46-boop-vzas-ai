@@ -41,6 +41,7 @@ export default function Discover() {
   const router = useRouter();
   const [active, setActive] = useState<string>('Trending');
   const [query, setQuery] = useState('');
+  const [showNsfw, setShowNsfw] = useState(false);
   const [characters, setCharacters] = useState<Character[]>([]);
   const [featured, setFeatured] = useState<Character[]>([]);
   const [loading, setLoading] = useState(true);
@@ -49,23 +50,25 @@ export default function Discover() {
   const load = useCallback(async () => {
     try {
       let chars: Character[] = [];
+      const nsfwParam = showNsfw ? '&nsfw=true' : '';
       if (active === 'Trending') {
-        const data = await api<{ characters: Character[] }>('/characters/trending');
+        const data = await api<{ characters: Character[] }>(`/characters/trending?1=1${nsfwParam}`);
         chars = data.characters;
       } else if (active === 'Favorites') {
-        const data = await api<{ characters: Character[] }>('/characters?favorites_only=true&limit=200');
+        const data = await api<{ characters: Character[] }>(`/characters?favorites_only=true&limit=200${nsfwParam}`);
         chars = data.characters;
       } else {
         const params = new URLSearchParams();
         if (active !== 'All') params.set('category', active);
         if (query.trim()) params.set('search', query.trim());
+        if (showNsfw) params.set('nsfw', 'true');
         const data = await api<{ characters: Character[] }>(`/characters?${params.toString()}`);
         chars = data.characters;
       }
       setCharacters(chars);
       // Featured only on Trending / All
       if (active === 'Trending' || active === 'All') {
-        const feat = await api<{ characters: Character[] }>('/characters/featured');
+        const feat = await api<{ characters: Character[] }>(`/characters/featured?1=1${nsfwParam}`);
         setFeatured(feat.characters.slice(0, 6));
       } else {
         setFeatured([]);
@@ -76,7 +79,7 @@ export default function Discover() {
       setLoading(false);
       setRefreshing(false);
     }
-  }, [active, query]);
+  }, [active, query, showNsfw]);
 
   useFocusEffect(useCallback(() => { load(); }, [load]));
 
@@ -132,6 +135,16 @@ export default function Discover() {
           contentContainerStyle={styles.catRow}
           style={{ marginTop: Spacing.md }}
         >
+          <Pressable
+            testID="cat-nsfw"
+            onPress={() => { Haptics.selectionAsync().catch(() => {}); setShowNsfw((v) => !v); }}
+            style={[styles.catChip, showNsfw && styles.nsfwChipActive]}
+          >
+            <Ionicons name="flame" size={14} color={showNsfw ? '#fff' : '#EF4444'} />
+            <Text style={[styles.catText, showNsfw && styles.catTextActive]}>
+              {showNsfw ? 'NSFW on' : 'NSFW'}
+            </Text>
+          </Pressable>
           {CATEGORIES.map((c) => {
             const isActive = active === c.key;
             return (
@@ -267,6 +280,7 @@ const styles = StyleSheet.create({
     borderWidth: 1, borderColor: Colors.borderDefault,
   },
   catChipActive: { backgroundColor: Colors.brandPrimary, borderColor: Colors.brandPrimary },
+  nsfwChipActive: { backgroundColor: '#EF4444', borderColor: '#EF4444' },
   catText: { color: Colors.textSecondary, fontSize: 13, fontWeight: '500' },
   catTextActive: { color: '#fff' },
   sectionTitle: { color: Colors.textPrimary, fontSize: 18, fontWeight: '700', paddingHorizontal: Spacing.lg, marginBottom: 12 },
