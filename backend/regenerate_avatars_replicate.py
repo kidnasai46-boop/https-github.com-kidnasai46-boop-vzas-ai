@@ -32,7 +32,7 @@ import truststore
 truststore.inject_into_ssl()
 
 from motor.motor_asyncio import AsyncIOMotorClient
-from image_client import generate_avatar, is_configured
+from image_provider import generate_avatar, is_configured
 
 
 def build_prompt_for(character: dict) -> str:
@@ -109,19 +109,24 @@ async def main(args) -> int:
         # avatars should still be drawn in anime style (Hana, Riko, etc.).
         # The "NSFW model" env var is bound to the anime model on disk, so
         # passing nsfw=True to generate_avatar() = "use anime model".
+        # Style routing: most characters get the anime model; a curated set of
+        # "real-world" categories get the semi-realistic painted (Flux) style.
+        PAINTED_CATEGORIES = {"Romance", "Historical", "Helpers", "Slice of Life"}
         is_nsfw = bool(c.get("nsfw"))
-        is_anime = (
+        is_anime_tagged = (
             c.get("category") == "Anime"
             or any(str(t).lower() == "anime" for t in (c.get("tags") or []))
         )
-        use_anime_model = is_nsfw or is_anime
+        # Painted only if it's a real-world category AND not nsfw/anime-tagged.
+        wants_painted = (c.get("category") in PAINTED_CATEGORIES) and not is_nsfw and not is_anime_tagged
+        use_anime_model = not wants_painted
         prompt = build_prompt_for(c)
         if is_nsfw:
             label = "[NSFW]"
-        elif is_anime:
-            label = "[ANIM]"
+        elif wants_painted:
+            label = "[PAINT]"
         else:
-            label = "[SFW] "
+            label = "[ANIME]"
         print(f"  {i:>3}/{len(chars)} {label} {name:30s} ... ", end="", flush=True)
         t0 = time.time()
 
@@ -131,7 +136,7 @@ async def main(args) -> int:
         last_err: str | None = None
         for attempt in range(5):
             try:
-                data_uri = await generate_avatar(prompt, nsfw=use_anime_model)
+                data_uri = await generate_avatar(prompt, anime=use_anime_model, explicit=is_nsfw)
                 break
             except Exception as e:
                 last_err = str(e)[:120]
@@ -152,10 +157,8 @@ async def main(args) -> int:
         else:
             print(f"FAIL ({last_err})")
             failed.append((name, last_err or "unknown"))
-        # Pace between characters even on success to stay well under Replicate's
-        # free-tier limits. 10s is conservative; bump down to 2 if you have a
-        # paid Replicate plan.
-        await asyncio.sleep(10)
+        # Pace between characters to stay under Replicate rate limits.
+        await asyncio.sleep(8)
 
     elapsed = time.time() - started
     print()

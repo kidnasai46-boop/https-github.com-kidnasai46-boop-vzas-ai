@@ -27,7 +27,7 @@ import secrets
 from datetime import datetime, timezone, timedelta
 
 from llm_client import complete, stream as llm_stream
-from image_client import generate_avatar as replicate_avatar, is_configured as image_is_configured
+from image_provider import generate_avatar as replicate_avatar, is_configured as image_is_configured
 from seed_data import SEED_CHARACTERS
 from story_engine import (
     generate_story_arc, init_story_state, evaluate_meters_and_choices,
@@ -435,7 +435,8 @@ async def generate_avatar(req: AvatarGenRequest, user: dict = Depends(get_curren
     if not image_is_configured():
         raise HTTPException(status_code=400, detail="Image generation not configured — set REPLICATE_API_TOKEN")
     try:
-        data_uri = await replicate_avatar(req.prompt, nsfw=req.nsfw)
+        # NSFW characters use the anime checkpoint with explicit allowed.
+        data_uri = await replicate_avatar(req.prompt, anime=req.nsfw, explicit=req.nsfw)
         return {"avatar": data_uri}
     except HTTPException:
         raise
@@ -579,6 +580,29 @@ def build_system_prompt(char: dict, user: dict, scenario: Optional[dict], story_
 LLM_FALLBACK_REPLY = "*looks away thoughtfully* Sorry, my mind drifted for a moment. Could you say that again?"
 
 
+def _history_to_llm_messages(history: List[dict]) -> List[dict]:
+    """Map stored chat messages to {role, content} for the LLM.
+
+    Critical: image-type messages have a ~1.5 MB base64 data URI as content,
+    which decodes to roughly 150-200k tokens each — a couple of them blow
+    past even Cydonia's 131k context. Replace with a tiny text placeholder
+    so the LLM has scene continuity without the giant blob.
+    Also skip system/transition messages and empty content.
+    """
+    out: List[dict] = []
+    for m in history:
+        if m.get("role") not in ("user", "assistant"):
+            continue
+        content = m.get("content")
+        if not content:
+            continue
+        if m.get("type") == "image":
+            out.append({"role": m["role"], "content": "[she sent a photo here]"})
+        else:
+            out.append({"role": m["role"], "content": content})
+    return out
+
+
 async def _generate_assistant_reply(chat_id: str, char: dict, user: dict, scenario: Optional[dict],
                                     history: List[dict], story_block: str = "") -> tuple[str, bool]:
     """Build the conversation from history and get a fresh reply.
@@ -589,11 +613,7 @@ async def _generate_assistant_reply(chat_id: str, char: dict, user: dict, scenar
     """
     nsfw = bool(char.get("nsfw"))
     system_message = build_system_prompt(char, user, scenario, story_block=story_block)
-    messages = [
-        {"role": m["role"], "content": m["content"]}
-        for m in history
-        if m.get("role") in ("user", "assistant") and m.get("content")
-    ]
+    messages = _history_to_llm_messages(history)
     while messages and messages[0]["role"] == "assistant":
         messages.pop(0)
     if not messages:
@@ -910,11 +930,7 @@ async def send_message_stream(chat_id: str, req: SendMessageRequest, user: dict 
 
     async def event_gen():
         system_message = build_system_prompt(char, user, scenario, story_block=story_block)
-        msgs = [
-            {"role": m["role"], "content": m["content"]}
-            for m in history
-            if m.get("role") in ("user", "assistant") and m.get("content")
-        ]
+        msgs = _history_to_llm_messages(history)
         while msgs and msgs[0]["role"] == "assistant":
             msgs.pop(0)
         if not msgs:
@@ -1076,15 +1092,20 @@ async def in_chat_image(chat_id: str, req: InChatImageRequest, user: dict = Depe
         scene_lines = [
             (m["content"][:120])
             for m in recent
-            if m.get("role") in ("user", "assistant") and m.get("content")
+            if m.get("role") in ("user", "assistant") and m.get("content") and m.get("type") != "image"
         ]
         if scene_lines:
             parts.append(f"Current scene: {' | '.join(scene_lines)}")
         parts.append("casual candid selfie, in-the-moment, looking at the camera, intimate framing")
     prompt = ". ".join(p for p in parts if p)
 
+    is_nsfw = bool(char.get("nsfw"))
+    is_anime = (
+        char.get("category") == "Anime"
+        or any(str(t).lower() == "anime" for t in (char.get("tags") or []))
+    )
     try:
-        data_uri = await replicate_avatar(prompt, nsfw=bool(char.get("nsfw")))
+        data_uri = await replicate_avatar(prompt, anime=(is_anime or is_nsfw), explicit=is_nsfw)
     except Exception as e:
         logger.exception("In-chat image generation failed")
         raise HTTPException(status_code=500, detail=f"Image generation failed: {str(e)[:120]}")
