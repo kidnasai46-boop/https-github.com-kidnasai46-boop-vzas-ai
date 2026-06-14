@@ -104,6 +104,29 @@ _ANIME_NEG_SFW = (
 # Positive tags that steer the anime model toward safe, clothed output.
 _ANIME_SFW_POSITIVE = "rating_safe, sfw, fully clothed, modest clothing, decent, "
 
+# Cranked explicit booster for NSFW characters on the UNCENSORED Replicate
+# anime model (Novita censors this and returns black images).
+_ANIME_NSFW_POSITIVE = (
+    "nsfw, rating_explicit, explicit, fully nude, nude, naked, topless, "
+    "completely naked, bare breasts, large breasts, nipples, areola, "
+    "seductive, sensual, sexy, alluring, erotic, naked body, bare skin, "
+    "thighs, seductive pose, bedroom eyes, flirtatious, inviting, "
+)
+_ANIME_NSFW_FRAMING = (
+    "solo, 1person, cowboy shot, looking at viewer, detailed face, "
+    "detailed eyes, detailed body"
+)
+# HARD FLOOR — never generate minor-coded content. Legal non-negotiable;
+# always present in the NSFW negative.
+_ANIME_NSFW_FLOOR = (
+    ", child, loli, shota, kid, toddler, underage, young child, "
+    "petite child, minor, "
+    # Kill the recurring anillustrious body/face-paint artifact:
+    "body paint, painted body, colored skin, multicolor skin, "
+    "red skin, blue skin, split color skin, war paint, face paint, "
+    "bodypaint, two-tone skin, unnatural skin color"
+)
+
 # Non-anime characters use a semi-realistic DIGITAL PAINTING style (not
 # photoreal) so they sit next to the anime cast without the stock-photo clash.
 _FLUX_STYLE = (
@@ -146,10 +169,13 @@ async def generate_avatar(
 
     if anime:
         model = _anime_model()
-        # For SFW, prepend safe-rating tags AND add the strong SFW negatives.
-        safe_tags = "" if explicit else _ANIME_SFW_POSITIVE
-        prompt = f"{_ANIME_QUALITY}, {safe_tags}{_ANIME_FRAMING}, 1person, {user_prompt}"
-        negative = _ANIME_NEG_BASE + ("" if explicit else _ANIME_NEG_SFW)
+        if explicit:
+            # Cranked explicit + minor-block floor.
+            prompt = f"{_ANIME_QUALITY}, {_ANIME_NSFW_POSITIVE}{_ANIME_NSFW_FRAMING}, {user_prompt}"
+            negative = _ANIME_NEG_BASE + _ANIME_NSFW_FLOOR
+        else:
+            prompt = f"{_ANIME_QUALITY}, {_ANIME_SFW_POSITIVE}{_ANIME_FRAMING}, 1person, {user_prompt}"
+            negative = _ANIME_NEG_BASE + _ANIME_NEG_SFW
         # Portrait dimensions read well as avatars; adetailer cleans up faces.
         params = {
             "prompt": prompt,

@@ -12,7 +12,13 @@ def _provider() -> str:
 
 
 async def generate_avatar(user_prompt: str, anime: bool = False, explicit: bool = False) -> str:
-    if _provider() == "novita":
+    # NSFW/explicit always uses the uncensored provider (Replicate). Novita
+    # censors full nudity (returns black images), so SFW + painted go to
+    # Novita for quality + safety, while explicit content goes to Replicate's
+    # uncensored anime model regardless of IMAGE_PROVIDER.
+    if explicit:
+        from image_client import generate_avatar as _gen
+    elif _provider() == "novita":
         from novita_client import generate_avatar as _gen
     else:
         from image_client import generate_avatar as _gen

@@ -71,6 +71,21 @@ _ANIME_NEG_SFW = (
     "sideboob, wet clothes"
 )
 _ANIME_SFW_POSITIVE = "rating_safe, sfw, fully clothed, modest clothing, decent, "
+# Booster tags for NSFW characters — pushes hard toward explicit nudity.
+_ANIME_NSFW_POSITIVE = (
+    "nsfw, rating_explicit, explicit, fully nude, nude, naked, topless, "
+    "completely naked, bare breasts, large breasts, nipples, areola, "
+    "seductive, sensual, sexy, alluring, erotic, naked body, bare skin, "
+    "thighs, seductive pose, bedroom eyes, flirtatious, inviting, "
+)
+# NSFW gets a fuller frame so the nude body is visible.
+_ANIME_NSFW_FRAMING = "solo, 1person, cowboy shot, looking at viewer, detailed face, detailed eyes, detailed body"
+# HARD FLOOR — never generate minor-coded content, regardless of explicitness.
+# This is a legal non-negotiable; kept in the NSFW negative at all times.
+_ANIME_NSFW_FLOOR = (
+    ", child, loli, shota, kid, toddler, underage, young child, "
+    "flat chest, petite child, minor"
+)
 
 _PAINT_POSITIVE = (
     "digital painting, fantasy concept art, painterly, artstation, "
@@ -87,9 +102,12 @@ _PAINT_NEG = (
 def _build(user_prompt: str, anime: bool, explicit: bool):
     """Return (model, prompt, negative_prompt) for the given routing."""
     if anime:
-        safe = "" if explicit else _ANIME_SFW_POSITIVE
-        prompt = f"{_ANIME_QUALITY}, {safe}{_ANIME_FRAMING}, 1person, {user_prompt}"
-        negative = _ANIME_NEG_BASE + ("" if explicit else _ANIME_NEG_SFW)
+        if explicit:
+            prompt = f"{_ANIME_QUALITY}, {_ANIME_NSFW_POSITIVE}{_ANIME_NSFW_FRAMING}, {user_prompt}"
+            negative = _ANIME_NEG_BASE + _ANIME_NSFW_FLOOR
+        else:
+            prompt = f"{_ANIME_QUALITY}, {_ANIME_SFW_POSITIVE}{_ANIME_FRAMING}, 1person, {user_prompt}"
+            negative = _ANIME_NEG_BASE + _ANIME_NEG_SFW
         return _anime_model(explicit), prompt, negative
     prompt = f"{_PAINT_POSITIVE}. Character: {user_prompt}"
     return _paint_model(), prompt, _PAINT_NEG
